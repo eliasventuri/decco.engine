@@ -5,6 +5,7 @@ const torrentStream = require('torrent-stream');
 const cors = require('cors');
 const fs = require('fs');
 const ffmpeg = require('fluent-ffmpeg');
+const { autoUpdater } = require('electron-updater');
 
 const PORT = 8888;
 const DOWNLOAD_PATH = path.join(app.getPath('userData'), 'downloads');
@@ -393,8 +394,70 @@ else {
         if (url) handleLink(url);
     });
 
+    const UPDATE_INFO_PATH = path.join(DOWNLOAD_PATH, 'update-info.json');
+
+    function loadUpdateInfo() {
+        try {
+            if (fs.existsSync(UPDATE_INFO_PATH)) {
+                return JSON.parse(fs.readFileSync(UPDATE_INFO_PATH, 'utf-8'));
+            }
+        } catch (e) { }
+        return { lastUpdated: null, version: app.getVersion() };
+    }
+
+    function saveUpdateInfo(info) {
+        try {
+            fs.writeFileSync(UPDATE_INFO_PATH, JSON.stringify(info, null, 2));
+        } catch (e) { }
+    }
+
+    function updateTrayMenu() {
+        if (!tray) return;
+
+        const updateInfo = loadUpdateInfo();
+        const lastUpdated = updateInfo.lastUpdated ? new Date(updateInfo.lastUpdated).toLocaleString() : 'Never';
+        const version = app.getVersion();
+
+        const contextMenu = Menu.buildFromTemplate([
+            { label: `Decco Engine: v${version}`, enabled: false },
+            { label: `Last Updated: ${lastUpdated}`, enabled: false },
+            { type: 'separator' },
+            {
+                label: 'Check for Updates', click: () => {
+                    console.log('[Tray] User requested update check');
+                    autoUpdater.checkForUpdatesAndNotify();
+                    tray.displayBalloon({ title: 'Decco Engine', content: 'Checking for updates...' });
+                }
+            },
+            { type: 'separator' },
+            { label: 'Clear Cache', click: () => clearAllCache() },
+            { label: 'Restart', click: () => { app.relaunch(); app.exit(0); } },
+            { type: 'separator' },
+            { label: 'Quit Engine', click: () => app.quit() }
+        ]);
+
+        tray.setToolTip(`Decco Engine v${version}`);
+        tray.setContextMenu(contextMenu);
+    }
+
+    // Check if version changed since last run to update timestamp
+    function checkVersionChange() {
+        const info = loadUpdateInfo();
+        const currentVersion = app.getVersion();
+
+        if (info.version !== currentVersion) {
+            info.version = currentVersion;
+            info.lastUpdated = Date.now();
+            saveUpdateInfo(info);
+            console.log(`[Updater] Version changed to ${currentVersion}. Updated timestamp.`);
+        }
+    }
+
     app.on('ready', () => {
         try {
+            // Check version change first
+            checkVersionChange();
+
             // Try PNG first (works on all platforms), then ICO
             let iconPath = path.join(__dirname, 'icon.png');
             if (!fs.existsSync(iconPath)) {
@@ -402,16 +465,7 @@ else {
             }
             if (fs.existsSync(iconPath)) {
                 tray = new Tray(iconPath);
-                const contextMenu = Menu.buildFromTemplate([
-                    { label: 'Decco Engine: running', enabled: false },
-                    { type: 'separator' },
-                    { label: 'Clear Cache', click: () => clearAllCache() },
-                    { label: 'Restart', click: () => { app.relaunch(); app.exit(0); } },
-                    { type: 'separator' },
-                    { label: 'Quit Engine', click: () => app.quit() }
-                ]);
-                tray.setToolTip('Decco Engine');
-                tray.setContextMenu(contextMenu);
+                updateTrayMenu(); // Use dynamic menu
             } else {
                 console.log('[Tray] No icon file found, creating tray without icon');
             }
@@ -427,6 +481,49 @@ else {
 
         const url = process.argv.find(a => a.startsWith('decco://'));
         if (url) handleLink(url);
+
+        // --- AUTO UPDATE ---
+        autoUpdater.logger = require("electron-log");
+        autoUpdater.logger.transports.file.level = "info";
+
+        console.log('[Updater] Initializing...');
+
+        autoUpdater.on('checking-for-update', () => {
+            console.log('[Updater] Checking for update...');
+            if (tray) tray.setToolTip(`Decco Engine v${app.getVersion()} - Checking...`);
+        });
+        autoUpdater.on('update-available', (info) => {
+            console.log('[Updater] Update available:', info.version);
+            if (tray) tray.displayBalloon({ title: 'Decco Engine', content: `Update available: v${info.version}` });
+        });
+        autoUpdater.on('update-not-available', (info) => {
+            console.log('[Updater] Update not available.');
+            if (tray) tray.setToolTip(`Decco Engine v${app.getVersion()}`);
+        });
+        autoUpdater.on('error', (err) => {
+            console.log('[Updater] Error in auto-updater:', err);
+        });
+        autoUpdater.on('download-progress', (progressObj) => {
+            let log_message = "Download speed: " + progressObj.bytesPerSecond;
+            log_message = log_message + ' - Downloaded ' + progressObj.percent + '%';
+            log_message = log_message + ' (' + progressObj.transferred + "/" + progressObj.total + ')';
+            console.log('[Updater] ' + log_message);
+        });
+        autoUpdater.on('update-downloaded', (info) => {
+            console.log('[Updater] Update downloaded. Will install on quit.');
+            if (tray) tray.displayBalloon({ title: 'Decco Engine', content: 'Update ready. Restart to apply.' });
+
+            // Allow user to click to restart?
+            // For now just update persistence so next run has correct time? 
+            // Actually next run `checkVersionChange` will handle it.
+        });
+
+        autoUpdater.checkForUpdatesAndNotify();
+
+        setInterval(() => {
+            console.log('[Updater] Periodic update check...');
+            autoUpdater.checkForUpdatesAndNotify();
+        }, 1000 * 60 * 60 * 4); // Check every 4 hours
     });
 }
 

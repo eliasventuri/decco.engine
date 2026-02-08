@@ -1,5 +1,11 @@
 node_modules/
+node_modules/
+# dist/ (Included by user request)
 dist/
+!dist/Decco Engine Setup *.exe
+!dist/latest.yml
+!dist/*.blockmap
+build/
 build/
 .DS_Store
 *.log
