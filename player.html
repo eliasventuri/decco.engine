@@ -1,0 +1,182 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Decco Cinema Pro</title>
+    <link rel="stylesheet" href="https://cdn.plyr.io/3.7.8/plyr.css" />
+    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;700;900&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --plyr-color-main: #bd00ff;
+            --accent: #bd00ff;
+            --accent-glow: rgba(189, 0, 255, 0.4);
+        }
+
+        body,
+        html {
+            margin: 0;
+            padding: 0;
+            background: #000;
+            color: white;
+            font-family: 'Outfit', sans-serif;
+            height: 100vh;
+            width: 100vw;
+            overflow: hidden;
+            user-select: none;
+        }
+
+        .plyr {
+            height: 100vh !important;
+            width: 100vw !important;
+        }
+
+        /* Decco Customizations for Plyr */
+        .plyr--full-ui input[type=range] {
+            color: var(--accent);
+        }
+
+        .plyr__control--overlaid {
+            background: var(--accent-glow);
+        }
+
+        .plyr--video .plyr__control.plyr__tab-focus,
+        .plyr--video .plyr__control:hover,
+        .plyr--video .plyr__control[aria-expanded=true] {
+            background: var(--accent);
+        }
+
+        .loader {
+            position: fixed;
+            inset: 0;
+            background: #000;
+            z-index: 1000;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            transition: opacity 1s ease;
+        }
+
+        .loader.hidden {
+            opacity: 0;
+            pointer-events: none;
+        }
+
+        .viz {
+            width: 80px;
+            height: 80px;
+            border: 3px solid rgba(255, 255, 255, 0.02);
+            border-top: 3px solid var(--accent);
+            border-radius: 50%;
+            animation: roll 0.8s linear infinite;
+        }
+
+        @keyframes roll {
+            100% {
+                transform: rotate(360deg);
+            }
+        }
+
+        .brand {
+            font-size: 26px;
+            font-weight: 900;
+            letter-spacing: 0.6em;
+            background: linear-gradient(90deg, #bd00ff, #ff00ff);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            text-transform: uppercase;
+        }
+
+        .top-info {
+            position: fixed;
+            top: 30px;
+            left: 40px;
+            z-index: 100;
+            pointer-events: none;
+            display: flex;
+            align-items: center;
+            gap: 20px;
+        }
+
+        .btn-back {
+            pointer-events: auto;
+            background: none;
+            border: none;
+            color: white;
+            cursor: pointer;
+            transition: transform 0.2s;
+        }
+
+        .btn-back:hover {
+            transform: scale(1.1);
+            color: var(--accent);
+        }
+    </style>
+</head>
+
+<body>
+    <div class="loader" id="loader">
+        <div class="viz"></div>
+        <div class="brand" style="margin-top: 30px;">DECCO</div>
+        <div id="stat" style="margin-top: 20px; font-size: 14px; color: rgba(255,255,255,0.5);">Preparando Cinema
+            Stream...</div>
+    </div>
+
+    <div class="top-info">
+        <button class="btn-back" onclick="window.closePlayer()">
+            <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+                <path d="M19 12H5M12 19l-7-7 7-7" />
+            </svg>
+        </button>
+        <div id="titleDisp" style="font-weight: 700; font-size: 18px;">Decco Player</div>
+    </div>
+
+    <video id="player" playsinline controls></video>
+
+    <script src="https://cdn.plyr.io/3.7.8/plyr.js"></script>
+    <script>
+        const { ipcRenderer } = require('electron');
+        const urlParams = new URLSearchParams(window.location.search);
+        const hash = urlParams.get('hash');
+        const title = decodeURIComponent(urlParams.get('title') || 'Decco Cinema');
+
+        document.getElementById('titleDisp').textContent = title;
+
+        const video = document.getElementById('player');
+        video.src = `http://127.0.0.1:8888/stream/${hash}`;
+
+        const player = new Plyr(video, {
+            autoplay: true,
+            controls: ['play-large', 'play', 'progress', 'current-time', 'mute', 'volume', 'captions', 'settings', 'pip', 'airplay', 'fullscreen'],
+            settings: ['quality', 'speed'],
+            invertTime: false
+        });
+
+        player.on('ready', () => {
+            console.log('Plyr Ready');
+        });
+
+        player.on('playing', () => {
+            document.getElementById('loader').classList.add('hidden');
+        });
+
+        ipcRenderer.on('status-update', (e, d) => {
+            document.getElementById('stat').textContent = `${d.peers} pares | ${d.speed} KB/s`;
+        });
+
+        window.closePlayer = () => ipcRenderer.send('close-player');
+
+        // Handle error and retry if stream drops
+        player.on('error', (e) => {
+            console.error('Player error:', e);
+            setTimeout(() => {
+                video.src = `http://127.0.0.1:8888/stream/${hash}?retry=${Date.now()}`;
+                player.play();
+            }, 2000);
+        });
+    </script>
+</body>
+
+</html>
