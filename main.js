@@ -454,11 +454,11 @@ else {
         const info = loadUpdateInfo();
         const currentVersion = app.getVersion();
 
-        if (info.version !== currentVersion) {
+        if (info.version !== currentVersion || !info.lastUpdated) {
             info.version = currentVersion;
             info.lastUpdated = Date.now();
             saveUpdateInfo(info);
-            console.log(`[Updater] Version changed to ${currentVersion}. Updated timestamp.`);
+            console.log(`[Updater] Version changed to ${currentVersion} or first run. Updated timestamp.`);
         }
     }
 
