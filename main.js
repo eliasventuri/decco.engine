@@ -411,6 +411,8 @@ else {
         } catch (e) { }
     }
 
+    let updateReady = false;
+
     function updateTrayMenu() {
         if (!tray) return;
 
@@ -430,13 +432,20 @@ else {
                 }
             },
             { type: 'separator' },
+            updateReady ? {
+                label: 'Install Update & Restart',
+                click: () => {
+                    console.log('[Tray] Installing update and restarting...');
+                    autoUpdater.quitAndInstall(true, true);
+                }
+            } : { label: 'Restart', click: () => { app.relaunch(); app.exit(0); } },
+
             { label: 'Clear Cache', click: () => clearAllCache() },
-            { label: 'Restart', click: () => { app.relaunch(); app.exit(0); } },
             { type: 'separator' },
             { label: 'Quit Engine', click: () => app.quit() }
         ]);
 
-        tray.setToolTip(`Decco Engine v${version}`);
+        tray.setToolTip(updateReady ? `Decco Engine v${version} (Update Ready)` : `Decco Engine v${version}`);
         tray.setContextMenu(contextMenu);
     }
 
@@ -457,6 +466,14 @@ else {
         try {
             // Check version change first
             checkVersionChange();
+
+            // Auto-start on login (Propagate to Windows Startup)
+            if (app.isPackaged) {
+                app.setLoginItemSettings({
+                    openAtLogin: true,
+                    path: app.getPath('exe')
+                });
+            }
 
             // Try PNG first (works on all platforms), then ICO
             let iconPath = path.join(__dirname, 'icon.png');
@@ -490,28 +507,36 @@ else {
 
         autoUpdater.on('checking-for-update', () => {
             console.log('[Updater] Checking for update...');
+            autoUpdater.logger.info('[Updater] Checking for update...');
             if (tray) tray.setToolTip(`Decco Engine v${app.getVersion()} - Checking...`);
         });
         autoUpdater.on('update-available', (info) => {
             console.log('[Updater] Update available:', info.version);
-            if (tray) tray.displayBalloon({ title: 'Decco Engine', content: `Update available: v${info.version}` });
+            autoUpdater.logger.info(`[Updater] Update available: ${info.version}`);
+            // Silent: Removed balloon notification
         });
         autoUpdater.on('update-not-available', (info) => {
             console.log('[Updater] Update not available.');
+            autoUpdater.logger.info('[Updater] Update not available.');
             if (tray) tray.setToolTip(`Decco Engine v${app.getVersion()}`);
         });
         autoUpdater.on('error', (err) => {
             console.log('[Updater] Error in auto-updater:', err);
+            autoUpdater.logger.error('[Updater] Error:', err);
+            // Silent: Removed error balloon
         });
         autoUpdater.on('download-progress', (progressObj) => {
             let log_message = "Download speed: " + progressObj.bytesPerSecond;
             log_message = log_message + ' - Downloaded ' + progressObj.percent + '%';
             log_message = log_message + ' (' + progressObj.transferred + "/" + progressObj.total + ')';
             console.log('[Updater] ' + log_message);
+            if (tray) tray.setToolTip(`Downloading: ${Math.round(progressObj.percent)}%`);
         });
         autoUpdater.on('update-downloaded', (info) => {
             console.log('[Updater] Update downloaded. Will install on quit.');
-            if (tray) tray.displayBalloon({ title: 'Decco Engine', content: 'Update ready. Restart to apply.' });
+            updateReady = true;
+            updateTrayMenu();
+            // Silent: Removed "Update ready" balloon
 
             // Allow user to click to restart?
             // For now just update persistence so next run has correct time? 

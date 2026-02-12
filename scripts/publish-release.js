@@ -2,22 +2,32 @@ const { execSync } = require('child_process');
 const path = require('path');
 const fs = require('fs');
 
+const GH_PATH_DEFAULT = 'gh';
+const GH_PATH_FALLBACK = 'C:\\Program Files\\GitHub CLI\\gh.exe';
+let GH_CMD = GH_PATH_DEFAULT;
+
 try {
     // 1. Check if gh CLI is installed
     try {
-        execSync('gh --version', { stdio: 'ignore' });
+        execSync(`${GH_CMD} --version`, { stdio: 'ignore' });
     } catch (e) {
-        console.error('Error: GitHub CLI (gh) is not installed or not in PATH.');
-        console.error('Please install it: https://cli.github.com/');
-        process.exit(1);
+        if (fs.existsSync(GH_PATH_FALLBACK)) {
+            console.log(`[Release] 'gh' not in PATH, using fallback: ${GH_PATH_FALLBACK}`);
+            GH_CMD = `"${GH_PATH_FALLBACK}"`;
+        } else {
+            console.error('Error: GitHub CLI (gh) is not installed or not in PATH.');
+            console.error(`Checked PATH and ${GH_PATH_FALLBACK}`);
+            console.error('Please install it: https://cli.github.com/');
+            process.exit(1);
+        }
     }
 
     // 2. Check if logged in
     try {
-        execSync('gh auth status', { stdio: 'ignore' });
+        execSync(`${GH_CMD} auth status`, { stdio: 'ignore' });
     } catch (e) {
         console.error('Error: You are not logged in to GitHub CLI.');
-        console.error('Please run: gh auth login');
+        console.error(`Please run: ${GH_CMD} auth login`);
         process.exit(1);
     }
 
@@ -50,8 +60,9 @@ try {
     console.log(`[Release] Creating GitHub Release ${tagName}...`);
 
     const distDir = path.join(__dirname, '../dist');
-    const installerName = `Decco Engine Setup ${version}.exe`;
-    const latestName = `Decco Engine Setup Latest.exe`;
+    // Artifact name matches package.json artifactName: ${name}-Setup-${version}.${ext}
+    const installerName = `decco-engine-Setup-${version}.exe`;
+    const latestName = `decco-engine-latest.exe`;
     const blockmapName = `${installerName}.blockmap`;
     const ymlName = 'latest.yml';
 
@@ -64,7 +75,7 @@ try {
 
     const fileArgs = filesToUpload.map(f => `"${f}"`).join(' ');
 
-    const cmd = `gh release create ${tagName} ${fileArgs} --title "Release ${tagName}" --notes "Automated release of version ${version}"`;
+    const cmd = `${GH_CMD} release create ${tagName} ${fileArgs} --title "Release ${tagName}" --notes "Automated release of version ${version}"`;
 
     execSync(cmd, { stdio: 'inherit' });
 

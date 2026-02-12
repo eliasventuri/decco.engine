@@ -1,13 +1,13 @@
 const fs = require('fs');
 const path = require('path');
 
+const appName = "decco-engine-Setup";
 const distDir = path.join(__dirname, '../dist');
 const packageJson = require('../package.json');
 const version = packageJson.version;
-const appName = "Decco Engine Setup";
 
-const versionedFile = path.join(distDir, `${appName} ${version}.exe`);
-const latestFile = path.join(distDir, `${appName} Latest.exe`);
+const versionedFile = path.join(distDir, `${appName}-${version}.exe`);
+const latestFile = path.join(distDir, `decco-engine-latest.exe`);
 
 console.log(`[Post-Build] Looking for: ${versionedFile}`);
 
