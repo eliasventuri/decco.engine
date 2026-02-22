@@ -467,11 +467,19 @@ else {
             // Check version change first
             checkVersionChange();
 
-            // Auto-start on login (Propagate to Windows Startup)
-            if (app.isPackaged) {
-                app.setLoginItemSettings({
-                    openAtLogin: true,
-                    path: app.getPath('exe')
+            // Auto-start on login (Windows Registry - Direct Write)
+            // Electron's setLoginItemSettings can silently fail for per-machine installs,
+            // so we write directly to the registry as a reliable fallback.
+            if (app.isPackaged && process.platform === 'win32') {
+                const exePath = app.getPath('exe');
+                const regValue = `"${exePath}" --hidden`;
+                const { exec } = require('child_process');
+                exec(`reg add "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run" /v DeccoEngine /t REG_SZ /d "${regValue}" /f`, (err) => {
+                    if (err) {
+                        console.log('[AutoStart] Failed to write registry:', err.message);
+                    } else {
+                        console.log('[AutoStart] Registry entry set successfully:', regValue);
+                    }
                 });
             }
 
