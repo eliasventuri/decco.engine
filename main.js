@@ -863,6 +863,80 @@ else {
 
 // --- SERVER SETUP ---
 
+// Recursively find the first video file in a directory
+function findVideoFile(dir) {
+    if (!fs.existsSync(dir)) return null;
+    try {
+        const files = fs.readdirSync(dir);
+        for (const file of files) {
+            const fullPath = path.join(dir, file);
+            const stat = fs.statSync(fullPath);
+            if (stat.isDirectory()) {
+                const found = findVideoFile(fullPath);
+                if (found) return found;
+            } else if (/\.(mkv|mp4|avi|webm|ts|mov|flv|m4v|3gp|mpg|mpeg|ogv)$/i.test(file)) {
+                return fullPath;
+            }
+        }
+    } catch (e) {
+        console.error(`[findVideoFile] Error reading ${dir}:`, e.message);
+    }
+    return null;
+}
+
+// Serve a local file using range headers (essential for seeking and FFmpeg)
+function serveLocalFile(filePath, req, res) {
+    if (!fs.existsSync(filePath)) {
+        return res.status(404).send('File not found');
+    }
+
+    const stat = fs.statSync(filePath);
+    const fileSize = stat.size;
+    const range = req.headers.range;
+
+    const ext = path.extname(filePath).toLowerCase();
+    let contentType = 'video/mp4';
+    if (ext === '.mkv') contentType = 'video/x-matroska';
+    else if (ext === '.webm') contentType = 'video/webm';
+    else if (ext === '.avi') contentType = 'video/x-msvideo';
+
+    if (!range) {
+        res.writeHead(200, {
+            'Content-Length': fileSize,
+            'Content-Type': contentType
+        });
+        const stream = fs.createReadStream(filePath);
+        stream.pipe(res);
+        return;
+    }
+
+    const parts = range.replace(/bytes=/, "").split("-");
+    const start = parseInt(parts[0], 10);
+    const end = parts[1] ? parseInt(parts[1], 10) : fileSize - 1;
+
+    if (start >= fileSize || end >= fileSize) {
+        res.writeHead(416, {
+            'Content-Range': `bytes */${fileSize}`
+        });
+        return res.end();
+    }
+
+    const chunksize = (end - start) + 1;
+    res.writeHead(206, {
+        'Content-Range': `bytes ${start}-${end}/${fileSize}`,
+        'Accept-Ranges': 'bytes',
+        'Content-Length': chunksize,
+        'Content-Type': contentType
+    });
+
+    const stream = fs.createReadStream(filePath, { start, end });
+    stream.pipe(res);
+
+    req.on('close', () => {
+        stream.destroy();
+    });
+}
+
 const serverApp = express();
 serverApp.use(cors());
 
@@ -870,8 +944,25 @@ serverApp.use(cors());
 // This translates FFmpeg's Rage requests into Torrent byte reads
 serverApp.get('/proxy/:hash', (req, res) => {
     const { hash } = req.params;
+
+    // Check if fully downloaded first (for robustness)
+    const allMeta = loadDownloadsMeta();
+    const entry = allMeta.downloads[hash];
+    if (entry && entry.status === 'completed') {
+        const filePath = findVideoFile(entry.downloadDir);
+        if (filePath) {
+            console.log(`[Proxy] ${hash}: Serving fully downloaded file from local disk: ${filePath}`);
+            return serveLocalFile(filePath, req, res);
+        }
+    }
+
     const engine = activeEngines.get(hash);
     if (!engine || !engine.videoFile) return res.status(404).end();
+
+    if (engine.isMock) {
+        console.log(`[Proxy] ${hash}: Serving from mock local path: ${engine.videoFile.path}`);
+        return serveLocalFile(engine.videoFile.path, req, res);
+    }
 
     // Update last accessed time for cache cleanup
     updateTorrentAccess(hash);
@@ -917,6 +1008,48 @@ serverApp.get('/start/:hash', (req, res) => {
     const fileIdx = req.query.fileIdx !== undefined ? parseInt(req.query.fileIdx, 10) : null;
     const season = req.query.season !== undefined ? parseInt(req.query.season, 10) : null;
     const episode = req.query.episode !== undefined ? parseInt(req.query.episode, 10) : null;
+
+    // Check if fully downloaded first
+    const allMeta = loadDownloadsMeta();
+    const entry = allMeta.downloads[hash];
+    if (entry && entry.status === 'completed') {
+        console.log(`[HTTP Start] ${hash} is fully downloaded. Creating mock engine.`);
+        const filePath = findVideoFile(entry.downloadDir);
+        if (filePath) {
+            const fileName = path.basename(filePath);
+            const fileSize = fs.statSync(filePath).size;
+            
+            const mockEngine = {
+                status: 'ready',
+                metadataReady: true,
+                videoFile: {
+                    name: fileName,
+                    path: filePath,
+                    length: fileSize
+                },
+                requestedFileIdx: fileIdx,
+                files: [{ name: fileName, length: fileSize }],
+                duration: entry.duration || 0,
+                isMock: true
+            };
+            
+            activeEngines.set(hash, mockEngine);
+            
+            // Probe local file directly in background for duration
+            if (!mockEngine.duration) {
+                ffmpeg.ffprobe(filePath, (err, metadata) => {
+                    if (!err && metadata.format && metadata.format.duration) {
+                        mockEngine.duration = metadata.format.duration;
+                        console.log(`[Mock Engine] Precise duration found: ${mockEngine.duration}s`);
+                    }
+                });
+            }
+            
+            res.json({ status: 'started', hash, fileIdx, season, episode });
+            return;
+        }
+    }
+
     console.log(`[HTTP Start] hash: ${hash}, fileIdx: ${fileIdx}, S${season}E${episode}`);
     getEngine(hash, fileIdx, season, episode);
     res.json({ status: 'started', hash, fileIdx, season, episode });
