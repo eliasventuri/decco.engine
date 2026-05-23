@@ -1,4 +1,4 @@
-const { app, Tray, Menu } = require('electron');
+const { app, Tray, Menu, BrowserWindow, shell } = require('electron');
 const path = require('path');
 const express = require('express');
 const torrentStream = require('torrent-stream');
@@ -14,8 +14,298 @@ const logFile = fs.createWriteStream(path.join(DOWNLOAD_PATH, 'decco-engine.log'
 const CACHE_META_PATH = path.join(DOWNLOAD_PATH, 'cache-meta.json');
 const CACHE_MAX_AGE_MS = 72 * 60 * 60 * 1000; // 72 hours in milliseconds
 
+// --- DOWNLOAD SYSTEM ---
+const DOWNLOADS_DIR = path.join(app.getPath('userData'), 'completed-downloads');
+const DOWNLOADS_META_PATH = path.join(DOWNLOADS_DIR, 'downloads-meta.json');
+if (!fs.existsSync(DOWNLOADS_DIR)) fs.mkdirSync(DOWNLOADS_DIR, { recursive: true });
+
+const activeDownloads = new Map(); // hash -> { engine, meta, interval }
+let downloadsWindow = null;
+
 let tray = null;
 const activeEngines = new Map();
+
+// --- DOWNLOADS META PERSISTENCE ---
+
+function loadDownloadsMeta() {
+    try {
+        if (fs.existsSync(DOWNLOADS_META_PATH)) {
+            return JSON.parse(fs.readFileSync(DOWNLOADS_META_PATH, 'utf-8'));
+        }
+    } catch (e) {
+        console.log('[Downloads] Error loading meta:', e.message);
+        try {
+            const backupPath = DOWNLOADS_META_PATH + '.corrupted.' + Date.now();
+            fs.renameSync(DOWNLOADS_META_PATH, backupPath);
+            console.log(`[Downloads] Corrupted meta backed up to: ${backupPath}`);
+        } catch (err) {
+            console.log('[Downloads] Failed to backup corrupted meta:', err.message);
+        }
+    }
+    return { downloads: {} };
+}
+
+function saveDownloadsMeta(meta) {
+    try {
+        fs.writeFileSync(DOWNLOADS_META_PATH, JSON.stringify(meta, null, 2));
+    } catch (e) {
+        console.log('[Downloads] Error saving meta:', e.message);
+    }
+}
+
+// --- SRT TO WEBVTT CONVERTER ---
+
+function srtToWebVTT(srtContent) {
+    let vtt = 'WEBVTT\n\n';
+    // Normalize line endings
+    const lines = srtContent.replace(/\r\n/g, '\n').replace(/\r/g, '\n').split('\n');
+    for (let i = 0; i < lines.length; i++) {
+        const line = lines[i].trim();
+        // Convert SRT timestamps: 00:01:23,456 --> 00:01:25,789  to  00:01:23.456 --> 00:01:25.789
+        if (line.includes('-->') && line.includes(',')) {
+            vtt += line.replace(/,/g, '.') + '\n';
+        } else {
+            vtt += line + '\n';
+        }
+    }
+    return vtt;
+}
+
+async function downloadSubtitles(hash, title, imdbId, season, episode, downloadDir) {
+    if (!imdbId) return [];
+    try {
+        const url = `https://decco.tv/api/subtitles/external?imdbId=${imdbId}&season=${season || 0}&episode=${episode || 0}`;
+        console.log(`[Downloads] Fetching subtitles from: ${url}`);
+        const response = await fetch(url);
+        if (!response.ok) return [];
+        const data = await response.json();
+        const subtitles = data.subtitles || data || [];
+        if (!Array.isArray(subtitles) || subtitles.length === 0) return [];
+
+        const savedSubs = [];
+        for (const sub of subtitles.slice(0, 10)) { // Limit to 10 subtitle tracks
+            try {
+                const subUrl = sub.url || sub.src;
+                if (!subUrl) continue;
+                const subRes = await fetch(subUrl);
+                if (!subRes.ok) continue;
+                let content = await subRes.text();
+                const lang = sub.lang || sub.language || 'unknown';
+                // Convert SRT to WebVTT if needed
+                if (!content.trim().startsWith('WEBVTT')) {
+                    content = srtToWebVTT(content);
+                }
+                const safeName = title.replace(/[^a-zA-Z0-9\s.-]/g, '').substring(0, 80);
+                const vttPath = path.join(downloadDir, `${safeName}.${lang}.vtt`);
+                fs.writeFileSync(vttPath, content, 'utf-8');
+                savedSubs.push({ lang, label: sub.label || lang, path: vttPath });
+                console.log(`[Downloads] Saved subtitle: ${vttPath}`);
+            } catch (e) {
+                console.log(`[Downloads] Failed to download subtitle:`, e.message);
+            }
+        }
+        return savedSubs;
+    } catch (e) {
+        console.log('[Downloads] Subtitle fetch error:', e.message);
+        return [];
+    }
+}
+
+// --- DOWNLOAD ENGINE MANAGEMENT ---
+
+function getFileProgress(engine, file) {
+    if (!engine || !file || !engine.torrent) return 0;
+    try {
+        const torrent = engine.torrent;
+        const pieceLength = torrent.pieceLength || engine.pieceLength;
+        if (!pieceLength || pieceLength <= 0) return 0;
+        const startPiece = Math.floor(file.offset / pieceLength);
+        const endPiece = Math.floor((file.offset + file.length - 1) / pieceLength);
+        let have = 0;
+        const total = endPiece - startPiece + 1;
+        for (let i = startPiece; i <= endPiece; i++) {
+            if (engine.bitfield && engine.bitfield.get(i)) have++;
+        }
+        return total > 0 ? have / total : 0;
+    } catch (e) {
+        return 0;
+    }
+}
+
+function startDownload(hash, title, imdbId, season, episode, fileIdx) {
+    if (activeDownloads.has(hash)) {
+        console.log(`[Downloads] Already downloading: ${hash}`);
+        return activeDownloads.get(hash).meta;
+    }
+
+    const downloadDir = path.join(DOWNLOADS_DIR, hash.substring(0, 16));
+    if (!fs.existsSync(downloadDir)) fs.mkdirSync(downloadDir, { recursive: true });
+
+    console.log(`[Downloads] Starting download: ${title} (${hash})`);
+
+    const engine = torrentStream(`magnet:?xt=urn:btih:${hash}&tr=${TRACKERS.map(encodeURIComponent).join('&tr=')}`, {
+        tmp: downloadDir,
+        path: downloadDir,
+        trackers: TRACKERS,
+        connections: 100
+    });
+
+    const meta = {
+        hash,
+        title: title || 'Unknown',
+        imdbId: imdbId || '',
+        season: season || 0,
+        episode: episode || 0,
+        fileIdx: fileIdx,
+        status: 'loading', // loading | downloading | paused | completed | error
+        progress: 0,
+        speed: 0,
+        peers: 0,
+        fileName: null,
+        fileSize: 0,
+        downloadDir,
+        subtitles: [],
+        startedAt: Date.now(),
+        completedAt: null
+    };
+
+    engine.on('ready', () => {
+        let file = null;
+
+        // Priority 1: Episode pattern match
+        if (season && episode) {
+            file = findEpisodeFile(engine.files, season, episode);
+        }
+        // Priority 2: fileIdx
+        if (!file && fileIdx !== undefined && fileIdx !== null && engine.files[fileIdx]) {
+            file = engine.files[fileIdx];
+        }
+        // Priority 3: Largest video file
+        if (!file) {
+            const videoFiles = engine.files.filter(f => f.name.match(/\.(mkv|mp4|avi|webm|ts|mov|wmv|flv|m4v)$/i));
+            file = videoFiles.length > 0
+                ? videoFiles.reduce((a, b) => b.length > a.length ? b : a)
+                : engine.files[0];
+        }
+
+        // Deselect all, select only target
+        if (!file) {
+            console.error(`[Downloads] No video file found for hash: ${hash}`);
+            meta.status = 'error';
+            persistDownloadMeta(hash, meta);
+            return;
+        }
+
+        engine.files.forEach(f => f.deselect());
+        file.select();
+
+        meta.status = 'downloading';
+        meta.fileName = file.name;
+        meta.fileSize = file.length;
+        engine.videoFile = file;
+
+        console.log(`[Downloads] Selected file: ${file.name} (${(file.length / 1024 / 1024).toFixed(1)} MB)`);
+
+        // Start subtitle download in background
+        downloadSubtitles(hash, title, imdbId, season, episode, downloadDir)
+            .then(subs => {
+                meta.subtitles = subs;
+                persistDownloadMeta(hash, meta);
+            });
+
+        // Progress polling
+        const interval = setInterval(() => {
+            const progress = getFileProgress(engine, file);
+            meta.progress = progress;
+            meta.speed = engine.swarm ? engine.swarm.downloadSpeed() : 0;
+            meta.peers = engine.swarm ? engine.swarm.wires.length : 0;
+
+            if (progress >= 1.0 && meta.status === 'downloading') {
+                meta.status = 'completed';
+                meta.completedAt = Date.now();
+                meta.progress = 1.0;
+                clearInterval(interval);
+                console.log(`[Downloads] COMPLETED: ${meta.title}`);
+                persistDownloadMeta(hash, meta);
+            }
+        }, 1000);
+
+        activeDownloads.set(hash, { engine, meta, interval, file });
+        persistDownloadMeta(hash, meta);
+    });
+
+    engine.on('error', (err) => {
+        meta.status = 'error';
+        console.error(`[Downloads] Error for ${hash}:`, err.message);
+        persistDownloadMeta(hash, meta);
+    });
+
+    activeDownloads.set(hash, { engine, meta, interval: null });
+    return meta;
+}
+
+function persistDownloadMeta(hash, meta) {
+    const allMeta = loadDownloadsMeta();
+    allMeta.downloads[hash] = {
+        hash: meta.hash,
+        title: meta.title,
+        imdbId: meta.imdbId,
+        season: meta.season,
+        episode: meta.episode,
+        fileIdx: meta.fileIdx,
+        fileName: meta.fileName,
+        fileSize: meta.fileSize,
+        downloadDir: meta.downloadDir,
+        subtitles: meta.subtitles,
+        status: meta.status,
+        startedAt: meta.startedAt,
+        completedAt: meta.completedAt
+    };
+    saveDownloadsMeta(allMeta);
+}
+
+function restoreDownloads() {
+    const allMeta = loadDownloadsMeta();
+    const hashes = Object.keys(allMeta.downloads);
+    console.log(`[Downloads] Restoring ${hashes.length} downloads...`);
+    hashes.forEach(hash => {
+        const saved = allMeta.downloads[hash];
+        if (saved.status === 'downloading' || saved.status === 'loading') {
+            startDownload(hash, saved.title, saved.imdbId, saved.season, saved.episode, saved.fileIdx);
+        }
+    });
+}
+
+// --- DOWNLOADS WINDOW ---
+
+function createDownloadsWindow() {
+    if (downloadsWindow && !downloadsWindow.isDestroyed()) {
+        downloadsWindow.show();
+        downloadsWindow.focus();
+        return downloadsWindow;
+    }
+
+    downloadsWindow = new BrowserWindow({
+        width: 720,
+        height: 580,
+        title: 'Decco — Descargas',
+        icon: path.join(__dirname, 'icon.png'),
+        autoHideMenuBar: true,
+        backgroundColor: '#0a0a0a',
+        webPreferences: {
+            nodeIntegration: false,
+            contextIsolation: true
+        }
+    });
+
+    downloadsWindow.loadFile(path.join(__dirname, 'downloads.html'));
+
+    downloadsWindow.on('closed', () => {
+        downloadsWindow = null;
+    });
+
+    return downloadsWindow;
+}
 
 const TRACKERS = [
     'udp://opentor.net:6969',
@@ -174,12 +464,12 @@ function cleanOrphanedFiles(meta) {
     }
 }
 
-// --- CLEAR ALL CACHE ---
+// --- CLEAR ALL STREAMING CACHE (does NOT touch downloads) ---
 
 function clearAllCache() {
-    console.log('[Cache] Clearing all cache...');
+    console.log('[Cache] Clearing streaming cache only (downloads are NOT affected)...');
 
-    // Destroy all engines
+    // Destroy ONLY streaming engines — never touch activeDownloads
     activeEngines.forEach((engine, hash) => {
         try {
             engine.destroy();
@@ -187,19 +477,21 @@ function clearAllCache() {
     });
     activeEngines.clear();
 
-    // Clear meta file
+    // Clear streaming cache meta
     saveCacheMeta({ torrents: {} });
 
-    // Delete all files in download directory (except meta)
+    // Delete streaming cache files in DOWNLOAD_PATH (NOT DOWNLOADS_DIR)
+    // Preserve: cache-meta.json, decco-engine.log
+    const protectedFiles = new Set(['cache-meta.json', 'decco-engine.log']);
     try {
         const items = fs.readdirSync(DOWNLOAD_PATH);
         items.forEach(item => {
-            if (item !== 'cache-meta.json') {
+            if (!protectedFiles.has(item)) {
                 const itemPath = path.join(DOWNLOAD_PATH, item);
                 fs.rmSync(itemPath, { recursive: true, force: true });
             }
         });
-        console.log('[Cache] All cache cleared successfully');
+        console.log('[Cache] Streaming cache cleared successfully');
     } catch (e) {
         console.log('[Cache] Error clearing cache:', e.message);
     }
@@ -319,6 +611,13 @@ function getEngine(hash, fileIdx = null, season = null, episode = null) {
         engine.status = 'ready';
 
         // IMPORTANT: Deselect ALL files first to prevent downloading entire pack
+        if (!file) {
+            console.error(`[Engine] No video file found for hash: ${hash}`);
+            engine.status = 'error';
+            engine.error = 'No video file found';
+            return;
+        }
+
         engine.files.forEach(f => f.deselect());
         // Then select ONLY the file we need
         file.select();
@@ -433,13 +732,14 @@ else {
             },
             { type: 'separator' },
             updateReady ? {
-                label: 'Install Update & Restart',
+                label: 'Install Update and Restart',
                 click: () => {
                     console.log('[Tray] Installing update and restarting...');
                     autoUpdater.quitAndInstall(true, true);
                 }
             } : { label: 'Restart', click: () => { app.relaunch(); app.exit(0); } },
 
+            { label: 'Manage Downloads', click: () => createDownloadsWindow() },
             { label: 'Clear Cache', click: () => clearAllCache() },
             { type: 'separator' },
             { label: 'Quit Engine', click: () => app.quit() }
@@ -498,9 +798,10 @@ else {
         if (process.platform === 'darwin') app.dock.hide();
         try { serverApp.listen(PORT, "127.0.0.1"); } catch (e) { }
 
-        // Start seeding restoration and cache cleanup
+        // Start seeding restoration, download restoration, and cache cleanup
         setTimeout(() => {
             restoreCachedTorrents();
+            restoreDownloads();
             startCacheCleanup();
         }, 3000); // Delay to ensure server is ready
 
@@ -637,6 +938,26 @@ serverApp.get('/status/:hash', (req, res) => {
         peers: engine.swarm ? engine.swarm.wires.length : 0,
         speed: engine.swarm ? (engine.swarm.downloadSpeed() / 1024).toFixed(2) : '0',
     });
+});
+
+serverApp.post('/cache/clear', (req, res) => {
+    try {
+        clearAllCache();
+        res.json({ status: 'ok', cleared: true });
+    } catch (error) {
+        console.error('[Cache] Failed to clear cache via API:', error);
+        res.status(500).json({ status: 'error', cleared: false, error: error.message });
+    }
+});
+
+serverApp.delete('/cache/clear', (req, res) => {
+    try {
+        clearAllCache();
+        res.json({ status: 'ok', cleared: true });
+    } catch (error) {
+        console.error('[Cache] Failed to clear cache via API:', error);
+        res.status(500).json({ status: 'error', cleared: false, error: error.message });
+    }
 });
 
 // HLS Manifest (Virtual VOD)
@@ -795,4 +1116,153 @@ serverApp.get('/subtitles/:hash/extract/:index', (req, res) => {
             }
         })
         .pipe(res, { end: true });
+});
+
+// --- DOWNLOAD ENDPOINTS ---
+
+serverApp.get('/download/start', (req, res) => {
+    const { hash, title, imdbId, season, episode, fileIdx } = req.query;
+    if (!hash) return res.status(400).json({ error: 'hash is required' });
+
+    const meta = startDownload(
+        hash,
+        decodeURIComponent(title || 'Video'),
+        imdbId || '',
+        season ? parseInt(season) : 0,
+        episode ? parseInt(episode) : 0,
+        fileIdx !== undefined ? parseInt(fileIdx) : null
+    );
+
+    res.json({ status: 'started', hash, title: meta.title });
+});
+
+serverApp.get('/download/list', (req, res) => {
+    const result = [];
+    const allMeta = loadDownloadsMeta();
+
+    // Merge persisted meta with live data from active downloads
+    for (const [hash, entry] of Object.entries(allMeta.downloads)) {
+        const active = activeDownloads.get(hash);
+        if (active) {
+            result.push({
+                ...active.meta,
+                progress: active.meta.progress,
+                speed: active.meta.speed,
+                peers: active.meta.peers
+            });
+        } else {
+            // Not actively downloading (completed or stopped)
+            result.push({
+                ...entry,
+                progress: entry.status === 'completed' ? 1.0 : 0,
+                speed: 0,
+                peers: 0
+            });
+        }
+    }
+
+    res.json({ downloads: result });
+});
+
+serverApp.get('/download/pause/:hash', (req, res) => {
+    const { hash } = req.params;
+    const active = activeDownloads.get(hash);
+    if (!active) return res.status(404).json({ error: 'Download not found' });
+
+    if (active.interval) clearInterval(active.interval);
+    if (active.engine) {
+        try { active.engine.destroy(); } catch (e) { }
+    }
+    active.meta.status = 'paused';
+    persistDownloadMeta(hash, active.meta);
+    activeDownloads.delete(hash);
+
+    res.json({ status: 'paused', hash });
+});
+
+serverApp.get('/download/resume/:hash', (req, res) => {
+    const { hash } = req.params;
+    const allMeta = loadDownloadsMeta();
+    const saved = allMeta.downloads[hash];
+    if (!saved) return res.status(404).json({ error: 'Download not found in meta' });
+
+    startDownload(hash, saved.title, saved.imdbId, saved.season, saved.episode, saved.fileIdx);
+    res.json({ status: 'resumed', hash });
+});
+
+serverApp.get('/download/delete/:hash', (req, res) => {
+    const { hash } = req.params;
+
+    // Stop active download if running
+    const active = activeDownloads.get(hash);
+    const allMeta = loadDownloadsMeta();
+    const entry = allMeta.downloads[hash];
+
+    const deleteFiles = () => {
+        if (entry && entry.downloadDir) {
+            try {
+                fs.rmSync(entry.downloadDir, { recursive: true, force: true });
+                console.log(`[Downloads] Deleted files: ${entry.downloadDir}`);
+            } catch (e) {
+                console.log('[Downloads] Error deleting files on first attempt, scheduling retry:', e.message);
+                setTimeout(() => {
+                    try {
+                        fs.rmSync(entry.downloadDir, { recursive: true, force: true });
+                        console.log(`[Downloads] Deleted files on retry: ${entry.downloadDir}`);
+                    } catch (err) {
+                        console.log('[Downloads] Failed second attempt to delete files:', err.message);
+                    }
+                }, 1000);
+            }
+        }
+    };
+
+    if (active) {
+        if (active.interval) clearInterval(active.interval);
+        if (active.engine) {
+            try {
+                active.engine.destroy(() => {
+                    console.log(`[Downloads] Engine destroyed, executing directory removal for: ${hash}`);
+                    deleteFiles();
+                });
+            } catch (e) {
+                deleteFiles();
+            }
+        } else {
+            deleteFiles();
+        }
+        activeDownloads.delete(hash);
+    } else {
+        deleteFiles();
+    }
+
+    // Remove from meta
+    delete allMeta.downloads[hash];
+    saveDownloadsMeta(allMeta);
+
+    res.json({ status: 'deleted', hash });
+});
+
+serverApp.get('/download/open/:hash', (req, res) => {
+    const { hash } = req.params;
+    const allMeta = loadDownloadsMeta();
+    const entry = allMeta.downloads[hash];
+    if (!entry || !entry.downloadDir) {
+        return res.status(404).json({ error: 'Download not found' });
+    }
+
+    // Find the video file in the download directory
+    try {
+        const files = fs.readdirSync(entry.downloadDir);
+        const videoFile = files.find(f => /\.(mkv|mp4|avi|webm|ts|mov|flv|m4v)$/i.test(f));
+        if (videoFile) {
+            shell.showItemInFolder(path.join(entry.downloadDir, videoFile));
+        } else {
+            shell.openPath(entry.downloadDir);
+        }
+    } catch (e) {
+        shell.openPath(entry.downloadDir);
+    }
+
+    res.json({ status: 'opened', hash });
 });
