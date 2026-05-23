@@ -950,25 +950,34 @@ else {
 
 // --- SERVER SETUP ---
 
-// Recursively find the first video file in a directory
+// Recursively find the largest video file in a directory
 function findVideoFile(dir) {
     if (!fs.existsSync(dir)) return null;
-    try {
-        const files = fs.readdirSync(dir);
-        for (const file of files) {
-            const fullPath = path.join(dir, file);
-            const stat = fs.statSync(fullPath);
-            if (stat.isDirectory()) {
-                const found = findVideoFile(fullPath);
-                if (found) return found;
-            } else if (/\.(mkv|mp4|avi|webm|ts|mov|flv|m4v|3gp|mpg|mpeg|ogv)$/i.test(file)) {
-                return fullPath;
+    let largestFile = null;
+    let largestSize = -1;
+
+    function scan(currentDir) {
+        try {
+            const files = fs.readdirSync(currentDir);
+            for (const file of files) {
+                const fullPath = path.join(currentDir, file);
+                const stat = fs.statSync(fullPath);
+                if (stat.isDirectory()) {
+                    scan(fullPath);
+                } else if (/\.(mkv|mp4|avi|webm|ts|mov|flv|m4v|3gp|mpg|mpeg|ogv)$/i.test(file)) {
+                    if (stat.size > largestSize) {
+                        largestSize = stat.size;
+                        largestFile = fullPath;
+                    }
+                }
             }
+        } catch (e) {
+            console.error(`[findVideoFile] Error reading ${currentDir}:`, e.message);
         }
-    } catch (e) {
-        console.error(`[findVideoFile] Error reading ${dir}:`, e.message);
     }
-    return null;
+
+    scan(dir);
+    return largestFile;
 }
 
 // Serve a local file using range headers (essential for seeking and FFmpeg)
