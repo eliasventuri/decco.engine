@@ -1200,41 +1200,42 @@ serverApp.get('/download/delete/:hash', (req, res) => {
 
     const deleteFiles = () => {
         if (entry && entry.downloadDir) {
-            try {
-                fs.rmSync(entry.downloadDir, { recursive: true, force: true });
-                console.log(`[Downloads] Deleted files: ${entry.downloadDir}`);
-            } catch (e) {
-                console.log('[Downloads] Error deleting files on first attempt, scheduling retry:', e.message);
-                setTimeout(() => {
-                    try {
+            const attemptDelete = (attempt) => {
+                try {
+                    if (fs.existsSync(entry.downloadDir)) {
                         fs.rmSync(entry.downloadDir, { recursive: true, force: true });
-                        console.log(`[Downloads] Deleted files on retry: ${entry.downloadDir}`);
-                    } catch (err) {
-                        console.log('[Downloads] Failed second attempt to delete files:', err.message);
+                        console.log(`[Downloads] Deleted files successfully on attempt ${attempt}: ${entry.downloadDir}`);
                     }
-                }, 1000);
-            }
+                } catch (e) {
+                    console.log(`[Downloads] Attempt ${attempt} failed to delete files for ${hash}:`, e.message);
+                    if (attempt < 5) {
+                        const delay = attempt * 1000;
+                        console.log(`[Downloads] Scheduling deletion retry attempt ${attempt + 1} in ${delay}ms`);
+                        setTimeout(() => attemptDelete(attempt + 1), delay);
+                    }
+                }
+            };
+            attemptDelete(1);
         }
     };
 
     if (active) {
-        if (active.interval) clearInterval(active.interval);
+        if (active.interval) {
+            try { clearInterval(active.interval); } catch (e) {}
+        }
         if (active.engine) {
             try {
-                active.engine.destroy(() => {
-                    console.log(`[Downloads] Engine destroyed, executing directory removal for: ${hash}`);
-                    deleteFiles();
-                });
+                active.engine.destroy();
+                console.log(`[Downloads] Engine destroyed successfully for hash: ${hash}`);
             } catch (e) {
-                deleteFiles();
+                console.log(`[Downloads] Error destroying engine:`, e.message);
             }
-        } else {
-            deleteFiles();
         }
         activeDownloads.delete(hash);
-    } else {
-        deleteFiles();
     }
+
+    // Always delete files from disk
+    deleteFiles();
 
     // Remove from meta
     delete allMeta.downloads[hash];
