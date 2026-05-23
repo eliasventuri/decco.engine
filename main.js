@@ -545,7 +545,7 @@ function getEngine(hash, fileIdx = null, season = null, episode = null) {
     if (activeEngines.has(hash)) {
         const existingEngine = activeEngines.get(hash);
         // Update file selection if season/episode provided and different
-        if (season !== null && episode !== null && existingEngine.metadataReady) {
+        if (season !== null && episode !== null && existingEngine.metadataReady && !existingEngine.isMock) {
             const targetPattern = buildEpisodePattern(season, episode);
             const currentFile = existingEngine.videoFile;
             if (currentFile && !targetPattern.test(currentFile.name)) {
@@ -561,6 +561,78 @@ function getEngine(hash, fileIdx = null, season = null, episode = null) {
             }
         }
         return existingEngine;
+    }
+
+    // Check downloads database first
+    const allMeta = loadDownloadsMeta();
+    const entry = allMeta.downloads[hash];
+    if (entry) {
+        if (entry.status === 'completed') {
+            console.log(`[Engine] ${hash} is fully downloaded. Creating mock engine in getEngine.`);
+            const filePath = findVideoFile(entry.downloadDir);
+            if (filePath) {
+                const fileName = path.basename(filePath);
+                const fileSize = fs.statSync(filePath).size;
+                
+                const mockEngine = {
+                    status: 'ready',
+                    metadataReady: true,
+                    videoFile: {
+                        name: fileName,
+                        path: filePath,
+                        length: fileSize
+                    },
+                    requestedFileIdx: fileIdx,
+                    files: [{ name: fileName, length: fileSize }],
+                    duration: entry.duration || 0,
+                    isMock: true
+                };
+                
+                activeEngines.set(hash, mockEngine);
+                
+                // Probe local file directly in background for duration
+                if (!mockEngine.duration) {
+                    ffmpeg.ffprobe(filePath, (err, metadata) => {
+                        if (!err && metadata.format && metadata.format.duration) {
+                            mockEngine.duration = metadata.format.duration;
+                            console.log(`[Mock Engine] Precise duration found in getEngine: ${mockEngine.duration}s`);
+                        }
+                    });
+                }
+                
+                return mockEngine;
+            }
+        } else {
+            // Downloading, loading or paused item - start/resume using download manager context to share progress!
+            console.log(`[Engine] Torrent ${hash} is currently downloading/paused in the database. Sharing download context.`);
+            let activeDl = activeDownloads.get(hash);
+            if (!activeDl) {
+                // Initialize startDownload to configure torrentStream inside the correct folder
+                startDownload(hash, entry.title, entry.imdbId, entry.season, entry.episode, entry.fileIdx);
+                activeDl = activeDownloads.get(hash);
+            }
+
+            if (activeDl && activeDl.engine) {
+                const dlEngine = activeDl.engine;
+                dlEngine.isMock = false;
+                dlEngine.requestedFileIdx = fileIdx;
+                dlEngine.requestedSeason = season;
+                dlEngine.requestedEpisode = episode;
+                
+                if (dlEngine.videoFile) {
+                    dlEngine.metadataReady = true;
+                    dlEngine.status = 'ready';
+                } else {
+                    dlEngine.on('ready', () => {
+                        dlEngine.metadataReady = true;
+                        dlEngine.status = 'ready';
+                    });
+                }
+                
+                activeEngines.set(hash, dlEngine);
+                return dlEngine;
+            }
+        }
     }
 
     console.log(`[Engine] Creating for hash: ${hash}, fileIdx: ${fileIdx}, S${season}E${episode}`);
