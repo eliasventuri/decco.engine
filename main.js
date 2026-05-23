@@ -590,12 +590,27 @@ function getEngine(hash, fileIdx = null, season = null, episode = null) {
                 
                 activeEngines.set(hash, mockEngine);
                 
-                // Probe local file directly in background for duration
+                // Probe local file in background for duration using the HTTP proxy URL (reliable and platform-agnostic)
                 if (!mockEngine.duration) {
-                    ffmpeg.ffprobe(filePath, (err, metadata) => {
+                    ffmpeg.ffprobe(`http://127.0.0.1:${PORT}/proxy/${hash}`, (err, metadata) => {
                         if (!err && metadata.format && metadata.format.duration) {
                             mockEngine.duration = metadata.format.duration;
                             console.log(`[Mock Engine] Precise duration found in getEngine: ${mockEngine.duration}s`);
+                            
+                            // Save duration in persistent downloads metadata
+                            try {
+                                const freshMeta = loadDownloadsMeta();
+                                const savedItem = freshMeta.downloads[hash];
+                                if (savedItem) {
+                                    savedItem.duration = mockEngine.duration;
+                                    saveDownloadsMeta(freshMeta);
+                                    console.log(`[Mock Engine] Saved precise duration to downloads database for ${hash}`);
+                                }
+                            } catch (saveErr) {
+                                console.error('[Mock Engine] Failed to save duration to database:', saveErr.message);
+                            }
+                        } else if (err) {
+                            console.error(`[Mock Engine] Duration probe failed: ${err.message}`);
                         }
                     });
                 }
