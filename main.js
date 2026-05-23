@@ -739,7 +739,7 @@ else {
                 }
             } : { label: 'Restart', click: () => { app.relaunch(); app.exit(0); } },
 
-            { label: 'Manage Downloads', click: () => createDownloadsWindow() },
+            { label: 'Manage Downloads', click: () => shell.openExternal('https://decco.tv/downloads') },
             { label: 'Clear Cache', click: () => clearAllCache() },
             { type: 'separator' },
             { label: 'Quit Engine', click: () => app.quit() }
