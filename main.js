@@ -934,14 +934,10 @@ else {
             if (tray) tray.setToolTip(`Downloading: ${Math.round(progressObj.percent)}%`);
         });
         autoUpdater.on('update-downloaded', (info) => {
-            console.log('[Updater] Update downloaded. Will install on quit.');
+            console.log('[Updater] Update downloaded. Forcing silent installation immediately.');
             updateReady = true;
-            updateTrayMenu();
-            // Silent: Removed "Update ready" balloon
-
-            // Allow user to click to restart?
-            // For now just update persistence so next run has correct time? 
-            // Actually next run `checkVersionChange` will handle it.
+            // Install the update silently and restart the app immediately
+            autoUpdater.quitAndInstall(true, true);
         });
 
         autoUpdater.checkForUpdatesAndNotify();
