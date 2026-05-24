@@ -92,20 +92,21 @@ async function downloadSubtitles(hash, title, imdbId, season, episode, videoFile
                 let content = await subRes.text();
                 const lang = sub.lang || sub.language || 'unknown';
                 const label = sub.label || lang;
-                // Convert SRT to WebVTT if needed
-                if (!content.trim().startsWith('WEBVTT')) {
-                    content = srtToWebVTT(content);
-                }
+                
                 const baseName = path.parse(videoFilePath).name;
                 const videoDir = path.dirname(videoFilePath);
                 if (!fs.existsSync(videoDir)) {
                     fs.mkdirSync(videoDir, { recursive: true });
                 }
-                const safeLabel = label.replace(/[^a-zA-Z0-9\s.-]/g, '').trim() || lang;
-                const vttPath = path.join(videoDir, `${baseName}.${safeLabel}.vtt`);
-                fs.writeFileSync(vttPath, content, 'utf-8');
-                savedSubs.push({ lang, label: label, path: vttPath });
-                console.log(`[Downloads] Saved subtitle: ${vttPath}`);
+                
+                // VLC ONLY reliably detects language track names from filenames if:
+                // 1. The extension is a classic subtitle format like .srt
+                // 2. The language code is an ISO 639 code (e.g. 'es', 'en')
+                // If we use .vtt or full words like 'Spanish', VLC defaults to 'Track 1'.
+                const srtPath = path.join(videoDir, `${baseName}.${lang}.srt`);
+                fs.writeFileSync(srtPath, content, 'utf-8');
+                savedSubs.push({ lang, label: label, path: srtPath });
+                console.log(`[Downloads] Saved subtitle: ${srtPath}`);
             } catch (e) {
                 console.log(`[Downloads] Failed to download subtitle:`, e.message);
             }
