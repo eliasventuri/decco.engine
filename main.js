@@ -91,6 +91,7 @@ async function downloadSubtitles(hash, title, imdbId, season, episode, videoFile
                 if (!subRes.ok) continue;
                 let content = await subRes.text();
                 const lang = sub.lang || sub.language || 'unknown';
+                const label = sub.label || lang;
                 // Convert SRT to WebVTT if needed
                 if (!content.trim().startsWith('WEBVTT')) {
                     content = srtToWebVTT(content);
@@ -100,9 +101,10 @@ async function downloadSubtitles(hash, title, imdbId, season, episode, videoFile
                 if (!fs.existsSync(videoDir)) {
                     fs.mkdirSync(videoDir, { recursive: true });
                 }
-                const vttPath = path.join(videoDir, `${baseName}.${lang}.vtt`);
+                const safeLabel = label.replace(/[^a-zA-Z0-9\s.-]/g, '').trim() || lang;
+                const vttPath = path.join(videoDir, `${baseName}.${safeLabel}.vtt`);
                 fs.writeFileSync(vttPath, content, 'utf-8');
-                savedSubs.push({ lang, label: sub.label || lang, path: vttPath });
+                savedSubs.push({ lang, label: label, path: vttPath });
                 console.log(`[Downloads] Saved subtitle: ${vttPath}`);
             } catch (e) {
                 console.log(`[Downloads] Failed to download subtitle:`, e.message);
