@@ -71,7 +71,7 @@ function srtToWebVTT(srtContent) {
     return vtt;
 }
 
-async function downloadSubtitles(hash, title, imdbId, season, episode, videoDir) {
+async function downloadSubtitles(hash, title, imdbId, season, episode, videoFilePath) {
     if (!imdbId) return [];
     try {
         const url = `https://decco.tv/api/subtitles/external?imdbId=${imdbId}&season=${season || 0}&episode=${episode || 0}`;
@@ -95,11 +95,12 @@ async function downloadSubtitles(hash, title, imdbId, season, episode, videoDir)
                 if (!content.trim().startsWith('WEBVTT')) {
                     content = srtToWebVTT(content);
                 }
-                const safeName = title.replace(/[^a-zA-Z0-9\s.-]/g, '').substring(0, 80);
+                const baseName = path.parse(videoFilePath).name;
+                const videoDir = path.dirname(videoFilePath);
                 if (!fs.existsSync(videoDir)) {
                     fs.mkdirSync(videoDir, { recursive: true });
                 }
-                const vttPath = path.join(videoDir, `${safeName}.${lang}.vtt`);
+                const vttPath = path.join(videoDir, `${baseName}.${lang}.vtt`);
                 fs.writeFileSync(vttPath, content, 'utf-8');
                 savedSubs.push({ lang, label: sub.label || lang, path: vttPath });
                 console.log(`[Downloads] Saved subtitle: ${vttPath}`);
@@ -215,8 +216,8 @@ function startDownload(hash, title, imdbId, season, episode, fileIdx) {
         console.log(`[Downloads] Selected file: ${file.name} (${(file.length / 1024 / 1024).toFixed(1)} MB)`);
 
         // Start subtitle download in background
-        const videoDir = path.dirname(path.join(downloadDir, file.path));
-        downloadSubtitles(hash, title, imdbId, season, episode, videoDir)
+        const videoFilePath = path.join(downloadDir, file.path);
+        downloadSubtitles(hash, title, imdbId, season, episode, videoFilePath)
             .then(subs => {
                 meta.subtitles = subs;
                 persistDownloadMeta(hash, meta);
