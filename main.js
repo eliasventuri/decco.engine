@@ -150,6 +150,9 @@ function startDownload(hash, title, imdbId, season, episode, fileIdx) {
         connections: 100
     });
 
+    const existingMeta = loadDownloadsMeta().downloads[hash];
+    const isAlreadyCompleted = existingMeta && existingMeta.status === 'completed';
+
     const meta = {
         hash,
         title: title || 'Unknown',
@@ -157,16 +160,16 @@ function startDownload(hash, title, imdbId, season, episode, fileIdx) {
         season: season || 0,
         episode: episode || 0,
         fileIdx: fileIdx,
-        status: 'loading', // loading | downloading | paused | completed | error
-        progress: 0,
+        status: isAlreadyCompleted ? 'completed' : 'loading',
+        progress: isAlreadyCompleted ? 1.0 : 0,
         speed: 0,
         peers: 0,
-        fileName: null,
-        fileSize: 0,
+        fileName: existingMeta ? existingMeta.fileName : null,
+        fileSize: existingMeta ? existingMeta.fileSize : 0,
         downloadDir,
-        subtitles: [],
-        startedAt: Date.now(),
-        completedAt: null
+        subtitles: existingMeta ? existingMeta.subtitles : [],
+        startedAt: existingMeta ? existingMeta.startedAt : Date.now(),
+        completedAt: existingMeta ? existingMeta.completedAt : null
     };
 
     engine.on('ready', () => {
@@ -199,7 +202,9 @@ function startDownload(hash, title, imdbId, season, episode, fileIdx) {
         engine.files.forEach(f => f.deselect());
         file.select();
 
-        meta.status = 'downloading';
+        if (meta.status !== 'completed') {
+            meta.status = 'downloading';
+        }
         meta.fileName = file.name;
         meta.fileSize = file.length;
         engine.videoFile = file;
@@ -270,7 +275,7 @@ function restoreDownloads() {
     console.log(`[Downloads] Restoring ${hashes.length} downloads...`);
     hashes.forEach(hash => {
         const saved = allMeta.downloads[hash];
-        if (saved.status === 'downloading' || saved.status === 'loading') {
+        if (saved.status === 'downloading' || saved.status === 'loading' || saved.status === 'completed') {
             startDownload(hash, saved.title, saved.imdbId, saved.season, saved.episode, saved.fileIdx);
         }
     });
