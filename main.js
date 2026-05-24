@@ -71,7 +71,7 @@ function srtToWebVTT(srtContent) {
     return vtt;
 }
 
-async function downloadSubtitles(hash, title, imdbId, season, episode, downloadDir) {
+async function downloadSubtitles(hash, title, imdbId, season, episode, videoDir) {
     if (!imdbId) return [];
     try {
         const url = `https://decco.tv/api/subtitles/external?imdbId=${imdbId}&season=${season || 0}&episode=${episode || 0}`;
@@ -96,7 +96,10 @@ async function downloadSubtitles(hash, title, imdbId, season, episode, downloadD
                     content = srtToWebVTT(content);
                 }
                 const safeName = title.replace(/[^a-zA-Z0-9\s.-]/g, '').substring(0, 80);
-                const vttPath = path.join(downloadDir, `${safeName}.${lang}.vtt`);
+                if (!fs.existsSync(videoDir)) {
+                    fs.mkdirSync(videoDir, { recursive: true });
+                }
+                const vttPath = path.join(videoDir, `${safeName}.${lang}.vtt`);
                 fs.writeFileSync(vttPath, content, 'utf-8');
                 savedSubs.push({ lang, label: sub.label || lang, path: vttPath });
                 console.log(`[Downloads] Saved subtitle: ${vttPath}`);
@@ -212,7 +215,8 @@ function startDownload(hash, title, imdbId, season, episode, fileIdx) {
         console.log(`[Downloads] Selected file: ${file.name} (${(file.length / 1024 / 1024).toFixed(1)} MB)`);
 
         // Start subtitle download in background
-        downloadSubtitles(hash, title, imdbId, season, episode, downloadDir)
+        const videoDir = path.dirname(path.join(downloadDir, file.path));
+        downloadSubtitles(hash, title, imdbId, season, episode, videoDir)
             .then(subs => {
                 meta.subtitles = subs;
                 persistDownloadMeta(hash, meta);
@@ -1482,12 +1486,11 @@ serverApp.get('/download/open/:hash', (req, res) => {
         return res.status(404).json({ error: 'Download not found' });
     }
 
-    // Find the video file in the download directory
+    // Find the actual video file in the download directory (including subfolders)
     try {
-        const files = fs.readdirSync(entry.downloadDir);
-        const videoFile = files.find(f => /\.(mkv|mp4|avi|webm|ts|mov|flv|m4v)$/i.test(f));
-        if (videoFile) {
-            shell.showItemInFolder(path.join(entry.downloadDir, videoFile));
+        const videoFilePath = findVideoFile(entry.downloadDir);
+        if (videoFilePath) {
+            shell.showItemInFolder(videoFilePath);
         } else {
             shell.openPath(entry.downloadDir);
         }
