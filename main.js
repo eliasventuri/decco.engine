@@ -83,7 +83,7 @@ async function downloadSubtitles(hash, title, imdbId, season, episode, videoFile
         if (!Array.isArray(subtitles) || subtitles.length === 0) return [];
 
         const savedSubs = [];
-        for (const sub of subtitles.slice(0, 10)) { // Limit to 10 subtitle tracks
+        for (const sub of subtitles) { // Download all available subtitle tracks
             try {
                 const subUrl = sub.url || sub.src;
                 if (!subUrl) continue;
