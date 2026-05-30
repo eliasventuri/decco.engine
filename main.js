@@ -7,7 +7,7 @@ const fs = require('fs');
 const ffmpeg = require('fluent-ffmpeg');
 const { autoUpdater } = require('electron-updater');
 
-const PORT = 18888;
+let PORT = 18889;
 const DOWNLOAD_PATH = path.join(app.getPath('userData'), 'downloads');
 const SEGMENT_DURATION = 10;
 const logFile = fs.createWriteStream(path.join(DOWNLOAD_PATH, 'decco-engine.log'), { flags: 'a' });
@@ -897,31 +897,60 @@ else {
         } catch (e) { console.log('[Tray] Error creating tray:', e.message); }
         if (process.platform === 'darwin') app.dock.hide();
         
-        // Start the server with robust fallback bindings (IPv4/IPv6 dual-stack)
-        const startServer = () => {
-            const server = serverApp.listen(PORT, "::", () => {
-                console.log(`[Server] Express server listening on all interfaces (IPv4/IPv6 dual-stack) on port ${PORT}`);
+        // Active ports tracking
+        const activePorts = [];
+        const registerActivePort = (port) => {
+            if (!activePorts.includes(port)) {
+                activePorts.push(port);
+            }
+            PORT = activePorts[0];
+            console.log(`[Server] Registered active port: ${port}. Primary engine port is now: ${PORT}`);
+        };
+
+        // Start the server with robust fallback bindings (IPv4/IPv6 dual-stack) on multiple ports for backwards compatibility
+        const startServerOnPort = (port) => {
+            const http = require('http');
+            const server = http.createServer(serverApp);
+
+            server.listen(port, "::", () => {
+                console.log(`[Server] Express server listening on port ${port} (IPv4/IPv6 dual-stack)`);
+                registerActivePort(port);
             });
 
             server.on('error', (err) => {
-                console.error(`[Server] Failed to bind to '::' on port ${PORT}:`, err.message);
+                console.error(`[Server] Failed to bind to '::' on port ${port}:`, err.message);
                 if (err.code === 'EADDRNOTAVAIL' || err.code === 'EINVAL') {
-                    console.log('[Server] IPv6 not supported or disabled. Retrying with IPv4 "0.0.0.0"...');
-                    const fallbackServer = serverApp.listen(PORT, "0.0.0.0", () => {
-                        console.log(`[Server] Express server listening on all IPv4 interfaces on port ${PORT}`);
+                    console.log(`[Server] IPv6 not supported. Retrying with IPv4 "0.0.0.0" on port ${port}...`);
+                    const fallbackServer = http.createServer(serverApp);
+                    fallbackServer.listen(port, "0.0.0.0", () => {
+                        console.log(`[Server] Express server listening on port ${port} (all IPv4 interfaces)`);
+                        registerActivePort(port);
                     });
                     fallbackServer.on('error', (err2) => {
-                        console.error(`[Server] Failed to bind to '0.0.0.0' on port ${PORT}:`, err2.message);
-                        console.log('[Server] Retrying with explicit loopback "127.0.0.1"...');
-                        const ultimateServer = serverApp.listen(PORT, "127.0.0.1", () => {
-                            console.log(`[Server] Express server listening on explicit IPv4 loopback 127.0.0.1:${PORT}`);
-                        });
+                        console.error(`[Server] Failed to bind to '0.0.0.0' on port ${port}:`, err2.message);
+                        console.log(`[Server] Retrying with explicit loopback "127.0.0.1" on port ${port}...`);
+                        const ultimateServer = http.createServer(serverApp);
                         ultimateServer.on('error', (err3) => {
-                            console.error(`[Server] Ultimate fallback to 127.0.0.1 failed:`, err3.message);
+                            console.error(`[Server] Ultimate fallback to 127.0.0.1 failed on port ${port}:`, err3.message);
+                        });
+                        ultimateServer.listen(port, "127.0.0.1", () => {
+                            console.log(`[Server] Express server listening on explicit loopback 127.0.0.1:${port}`);
+                            registerActivePort(port);
                         });
                     });
                 } else if (err.code === 'EADDRINUSE') {
-                    console.log(`[Server] Port ${PORT} is already in use. An instance of Decco Engine may already be running.`);
+                    console.log(`[Server] Port ${port} is already in use. Another instance or service might be running.`);
+                }
+            });
+        };
+
+        const startServer = () => {
+            const portsToTry = [18889, 18888, 28888, 38888, 48888, 8888];
+            portsToTry.forEach(port => {
+                try {
+                    startServerOnPort(port);
+                } catch (e) {
+                    console.error(`[Server] Failed to start server on port ${port}:`, e.message);
                 }
             });
         };
@@ -929,7 +958,7 @@ else {
         try {
             startServer();
         } catch (e) {
-            console.error('[Server] Critical exception starting server:', e.message);
+            console.error('[Server] Critical exception starting servers:', e.message);
         }
 
         // Start seeding restoration, download restoration, and cache cleanup
