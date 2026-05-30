@@ -154,6 +154,56 @@ async function downloadSubtitles(hash, title, imdbId, season, episode, videoFile
     }
 }
 
+// --- MULTIPACK CLEANUP ---
+// In season-pack/multipack torrents, BitTorrent pieces can span file boundaries.
+// Downloading S02E15 may cause S02E14's data to also be written to disk because
+// they share boundary pieces. This function removes unwanted video files.
+
+function cleanupUnwantedFiles(downloadDir, wantedFileName) {
+    const videoExtensions = /\.(mkv|mp4|avi|webm|ts|mov|wmv|flv|m4v|3gp|mpg|mpeg|ogv)$/i;
+
+    // Build a set of ALL wanted file names across every download entry
+    // that shares this same downloadDir (i.e. same torrent hash).
+    // This prevents deleting E14 when E15 completes if E14 was also
+    // intentionally downloaded by the user.
+    const wantedFiles = new Set();
+    wantedFiles.add(wantedFileName);
+    try {
+        const allMeta = loadDownloadsMeta();
+        for (const entry of Object.values(allMeta.downloads)) {
+            if (entry.downloadDir === downloadDir && entry.fileName) {
+                wantedFiles.add(entry.fileName);
+            }
+        }
+    } catch (e) {
+        console.log(`[Downloads] Could not read meta for cleanup: ${e.message}`);
+    }
+
+    function scanAndClean(dir) {
+        try {
+            if (!fs.existsSync(dir)) return;
+            const entries = fs.readdirSync(dir, { withFileTypes: true });
+            for (const entry of entries) {
+                const fullPath = path.join(dir, entry.name);
+                if (entry.isDirectory()) {
+                    scanAndClean(fullPath);
+                } else if (videoExtensions.test(entry.name) && !wantedFiles.has(entry.name)) {
+                    try {
+                        fs.unlinkSync(fullPath);
+                        console.log(`[Downloads] Cleaned up unwanted multipack file: ${entry.name}`);
+                    } catch (e) {
+                        console.log(`[Downloads] Failed to clean up ${entry.name}: ${e.message}`);
+                    }
+                }
+            }
+        } catch (e) {
+            console.log(`[Downloads] Cleanup scan error in ${dir}: ${e.message}`);
+        }
+    }
+    
+    scanAndClean(downloadDir);
+}
+
 // --- DOWNLOAD ENGINE MANAGEMENT ---
 
 function getFileProgress(engine, file) {
@@ -328,6 +378,11 @@ function startDownload(hash, title, imdbId, season, episode, fileIdx) {
                 clearInterval(interval);
                 console.log(`[Downloads] COMPLETED: ${meta.title}`);
                 persistDownloadMeta(downloadId, meta);
+
+                // Clean up unwanted video files from multipack/season-pack torrents.
+                // BitTorrent pieces can span file boundaries, so downloading one episode
+                // may cause adjacent episodes' data to also be written to disk.
+                cleanupUnwantedFiles(downloadDir, file.name);
             }
         }, 1000);
 
