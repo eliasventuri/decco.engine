@@ -27,6 +27,42 @@ const activeEngines = new Map();
 
 // --- DOWNLOADS META PERSISTENCE ---
 
+function getDownloadId(hash, season, episode, fileIdx) {
+    if (season && episode && (parseInt(season) > 0 || parseInt(episode) > 0)) {
+        return `${hash}_s${season}e${episode}`;
+    }
+    if (fileIdx !== undefined && fileIdx !== null && String(fileIdx) !== 'null') {
+        return `${hash}_f${fileIdx}`;
+    }
+    return hash;
+}
+
+function findExactVideoFile(dir, fileName) {
+    if (!fs.existsSync(dir)) return null;
+    let foundPath = null;
+
+    function scan(currentDir) {
+        try {
+            const files = fs.readdirSync(currentDir);
+            for (const file of files) {
+                const fullPath = path.join(currentDir, file);
+                const stat = fs.statSync(fullPath);
+                if (stat.isDirectory()) {
+                    scan(fullPath);
+                } else if (file === fileName) {
+                    foundPath = fullPath;
+                    return;
+                }
+            }
+        } catch (e) {
+            console.error(`[findExactVideoFile] Error reading ${currentDir}:`, e.message);
+        }
+    }
+
+    scan(dir);
+    return foundPath || findVideoFile(dir);
+}
+
 function loadDownloadsMeta() {
     try {
         if (fs.existsSync(DOWNLOADS_META_PATH)) {
@@ -140,9 +176,11 @@ function getFileProgress(engine, file) {
 }
 
 function startDownload(hash, title, imdbId, season, episode, fileIdx) {
-    if (activeDownloads.has(hash)) {
-        console.log(`[Downloads] Already downloading: ${hash}`);
-        return activeDownloads.get(hash).meta;
+    const downloadId = getDownloadId(hash, season, episode, fileIdx);
+
+    if (activeDownloads.has(downloadId)) {
+        console.log(`[Downloads] Already downloading: ${downloadId}`);
+        return activeDownloads.get(downloadId).meta;
     }
 
     const downloadDir = path.join(DOWNLOADS_DIR, hash.substring(0, 16));
@@ -179,7 +217,7 @@ function startDownload(hash, title, imdbId, season, episode, fileIdx) {
         }
     }
 
-    console.log(`[Downloads] Starting download: ${title} (${hash})`);
+    console.log(`[Downloads] Starting download: ${title} (${hash}) [ID: ${downloadId}]`);
 
     const engine = torrentStream(`magnet:?xt=urn:btih:${hash}&tr=${TRACKERS.map(encodeURIComponent).join('&tr=')}`, {
         tmp: downloadDir,
@@ -206,10 +244,11 @@ function startDownload(hash, title, imdbId, season, episode, fileIdx) {
         activeEngines.set(hash, engine);
     }
 
-    const existingMeta = loadDownloadsMeta().downloads[hash];
+    const existingMeta = loadDownloadsMeta().downloads[downloadId];
     const isAlreadyCompleted = existingMeta && existingMeta.status === 'completed';
 
     const meta = {
+        id: downloadId,
         hash,
         title: title || 'Unknown',
         imdbId: imdbId || '',
@@ -251,7 +290,7 @@ function startDownload(hash, title, imdbId, season, episode, fileIdx) {
         if (!file) {
             console.error(`[Downloads] No video file found for hash: ${hash}`);
             meta.status = 'error';
-            persistDownloadMeta(hash, meta);
+            persistDownloadMeta(downloadId, meta);
             return;
         }
 
@@ -272,7 +311,7 @@ function startDownload(hash, title, imdbId, season, episode, fileIdx) {
         downloadSubtitles(hash, title, imdbId, season, episode, videoFilePath)
             .then(subs => {
                 meta.subtitles = subs;
-                persistDownloadMeta(hash, meta);
+                persistDownloadMeta(downloadId, meta);
             });
 
         // Progress polling
@@ -288,27 +327,28 @@ function startDownload(hash, title, imdbId, season, episode, fileIdx) {
                 meta.progress = 1.0;
                 clearInterval(interval);
                 console.log(`[Downloads] COMPLETED: ${meta.title}`);
-                persistDownloadMeta(hash, meta);
+                persistDownloadMeta(downloadId, meta);
             }
         }, 1000);
 
-        activeDownloads.set(hash, { engine, meta, interval, file });
-        persistDownloadMeta(hash, meta);
+        activeDownloads.set(downloadId, { engine, meta, interval, file });
+        persistDownloadMeta(downloadId, meta);
     });
 
     engine.on('error', (err) => {
         meta.status = 'error';
         console.error(`[Downloads] Error for ${hash}:`, err.message);
-        persistDownloadMeta(hash, meta);
+        persistDownloadMeta(downloadId, meta);
     });
 
-    activeDownloads.set(hash, { engine, meta, interval: null });
+    activeDownloads.set(downloadId, { engine, meta, interval: null });
     return meta;
 }
 
-function persistDownloadMeta(hash, meta) {
+function persistDownloadMeta(downloadId, meta) {
     const allMeta = loadDownloadsMeta();
-    allMeta.downloads[hash] = {
+    allMeta.downloads[downloadId] = {
+        id: downloadId,
         hash: meta.hash,
         title: meta.title,
         imdbId: meta.imdbId,
@@ -328,12 +368,12 @@ function persistDownloadMeta(hash, meta) {
 
 function restoreDownloads() {
     const allMeta = loadDownloadsMeta();
-    const hashes = Object.keys(allMeta.downloads);
-    console.log(`[Downloads] Restoring ${hashes.length} downloads...`);
-    hashes.forEach(hash => {
-        const saved = allMeta.downloads[hash];
+    const downloadIds = Object.keys(allMeta.downloads);
+    console.log(`[Downloads] Restoring ${downloadIds.length} downloads...`);
+    downloadIds.forEach(id => {
+        const saved = allMeta.downloads[id];
         if (saved.status === 'downloading' || saved.status === 'loading' || saved.status === 'completed') {
-            startDownload(hash, saved.title, saved.imdbId, saved.season, saved.episode, saved.fileIdx);
+            startDownload(saved.hash, saved.title, saved.imdbId, saved.season, saved.episode, saved.fileIdx);
         }
     });
 }
@@ -627,11 +667,12 @@ function getEngine(hash, fileIdx = null, season = null, episode = null) {
 
     // Check downloads database first
     const allMeta = loadDownloadsMeta();
-    const entry = allMeta.downloads[hash];
+    const downloadId = getDownloadId(hash, season, episode, fileIdx);
+    const entry = allMeta.downloads[downloadId];
     if (entry) {
         if (entry.status === 'completed') {
-            console.log(`[Engine] ${hash} is fully downloaded. Creating mock engine in getEngine.`);
-            const filePath = findVideoFile(entry.downloadDir);
+            console.log(`[Engine] ${hash} (ID: ${downloadId}) is fully downloaded. Creating mock engine in getEngine.`);
+            const filePath = findExactVideoFile(entry.downloadDir, entry.fileName);
             if (filePath) {
                 const fileName = path.basename(filePath);
                 const fileSize = fs.statSync(filePath).size;
@@ -662,11 +703,11 @@ function getEngine(hash, fileIdx = null, season = null, episode = null) {
                             // Save duration in persistent downloads metadata
                             try {
                                 const freshMeta = loadDownloadsMeta();
-                                const savedItem = freshMeta.downloads[hash];
+                                const savedItem = freshMeta.downloads[downloadId];
                                 if (savedItem) {
                                     savedItem.duration = mockEngine.duration;
                                     saveDownloadsMeta(freshMeta);
-                                    console.log(`[Mock Engine] Saved precise duration to downloads database for ${hash}`);
+                                    console.log(`[Mock Engine] Saved precise duration to downloads database for ${downloadId}`);
                                 }
                             } catch (saveErr) {
                                 console.error('[Mock Engine] Failed to save duration to database:', saveErr.message);
@@ -682,11 +723,11 @@ function getEngine(hash, fileIdx = null, season = null, episode = null) {
         } else {
             // Downloading, loading or paused item - start/resume using download manager context to share progress!
             console.log(`[Engine] Torrent ${hash} is currently downloading/paused in the database. Sharing download context.`);
-            let activeDl = activeDownloads.get(hash);
+            let activeDl = activeDownloads.get(downloadId);
             if (!activeDl) {
                 // Initialize startDownload to configure torrentStream inside the correct folder
                 startDownload(hash, entry.title, entry.imdbId, entry.season, entry.episode, entry.fileIdx);
-                activeDl = activeDownloads.get(hash);
+                activeDl = activeDownloads.get(downloadId);
             }
 
             if (activeDl && activeDl.engine) {
@@ -1245,10 +1286,11 @@ serverApp.get('/start/:hash', (req, res) => {
 
     // Check if fully downloaded first
     const allMeta = loadDownloadsMeta();
-    const entry = allMeta.downloads[hash];
+    const downloadId = getDownloadId(hash, season, episode, fileIdx);
+    const entry = allMeta.downloads[downloadId];
     if (entry && entry.status === 'completed') {
-        console.log(`[HTTP Start] ${hash} is fully downloaded. Creating mock engine.`);
-        const filePath = findVideoFile(entry.downloadDir);
+        console.log(`[HTTP Start] ${hash} (ID: ${downloadId}) is fully downloaded. Creating mock engine.`);
+        const filePath = findExactVideoFile(entry.downloadDir, entry.fileName);
         if (filePath) {
             const fileName = path.basename(filePath);
             const fileSize = fs.statSync(filePath).size;
@@ -1500,7 +1542,7 @@ serverApp.get('/download/start', (req, res) => {
         fileIdx !== undefined ? parseInt(fileIdx) : null
     );
 
-    res.json({ status: 'started', hash, title: meta.title });
+    res.json({ status: 'started', hash, id: meta.id, title: meta.title });
 });
 
 serverApp.get('/download/list', (req, res) => {
@@ -1508,8 +1550,8 @@ serverApp.get('/download/list', (req, res) => {
     const allMeta = loadDownloadsMeta();
 
     // Merge persisted meta with live data from active downloads
-    for (const [hash, entry] of Object.entries(allMeta.downloads)) {
-        const active = activeDownloads.get(hash);
+    for (const [downloadId, entry] of Object.entries(allMeta.downloads)) {
+        const active = activeDownloads.get(downloadId);
         if (active) {
             result.push({
                 ...active.meta,
@@ -1531,58 +1573,120 @@ serverApp.get('/download/list', (req, res) => {
     res.json({ downloads: result });
 });
 
-serverApp.get('/download/pause/:hash', (req, res) => {
-    const { hash } = req.params;
-    const active = activeDownloads.get(hash);
+serverApp.get('/download/pause/:id', (req, res) => {
+    const { id } = req.params;
+    let active = activeDownloads.get(id);
+    if (!active) {
+        for (const [key, value] of activeDownloads.entries()) {
+            if (value.meta.hash === id) {
+                active = value;
+                break;
+            }
+        }
+    }
     if (!active) return res.status(404).json({ error: 'Download not found' });
+
+    const downloadId = active.meta.id || id;
 
     if (active.interval) clearInterval(active.interval);
     if (active.engine) {
         try { active.engine.destroy(); } catch (e) { }
     }
     active.meta.status = 'paused';
-    persistDownloadMeta(hash, active.meta);
-    activeDownloads.delete(hash);
+    persistDownloadMeta(downloadId, active.meta);
+    activeDownloads.delete(downloadId);
 
-    res.json({ status: 'paused', hash });
+    res.json({ status: 'paused', hash: active.meta.hash, id: downloadId });
 });
 
-serverApp.get('/download/resume/:hash', (req, res) => {
-    const { hash } = req.params;
+serverApp.get('/download/resume/:id', (req, res) => {
+    const { id } = req.params;
     const allMeta = loadDownloadsMeta();
-    const saved = allMeta.downloads[hash];
+    let saved = allMeta.downloads[id];
+    if (!saved) {
+        for (const [key, value] of Object.entries(allMeta.downloads)) {
+            if (value.hash === id) {
+                saved = value;
+                break;
+            }
+        }
+    }
     if (!saved) return res.status(404).json({ error: 'Download not found in meta' });
 
-    startDownload(hash, saved.title, saved.imdbId, saved.season, saved.episode, saved.fileIdx);
-    res.json({ status: 'resumed', hash });
+    startDownload(saved.hash, saved.title, saved.imdbId, saved.season, saved.episode, saved.fileIdx);
+    res.json({ status: 'resumed', hash: saved.hash, id: saved.id });
 });
 
-serverApp.get('/download/delete/:hash', (req, res) => {
-    const { hash } = req.params;
+serverApp.get('/download/delete/:id', (req, res) => {
+    const { id } = req.params;
+
+    const allMeta = loadDownloadsMeta();
+    let entry = allMeta.downloads[id];
+    let downloadId = id;
+
+    if (!entry) {
+        for (const [key, value] of Object.entries(allMeta.downloads)) {
+            if (value.hash === id) {
+                entry = value;
+                downloadId = key;
+                break;
+            }
+        }
+    }
 
     // Stop active download if running
-    const active = activeDownloads.get(hash);
-    const allMeta = loadDownloadsMeta();
-    const entry = allMeta.downloads[hash];
+    let active = activeDownloads.get(downloadId);
+    if (!active) {
+        for (const [key, value] of activeDownloads.entries()) {
+            if (value.meta.hash === id) {
+                active = value;
+                downloadId = key;
+                break;
+            }
+        }
+    }
 
     const deleteFiles = () => {
         if (entry && entry.downloadDir) {
-            const attemptDelete = (attempt) => {
+            const otherDownloads = Object.values(allMeta.downloads).filter(
+                d => d.hash === entry.hash && d.id !== entry.id
+            );
+
+            if (otherDownloads.length > 0) {
                 try {
-                    if (fs.existsSync(entry.downloadDir)) {
-                        fs.rmSync(entry.downloadDir, { recursive: true, force: true });
-                        console.log(`[Downloads] Deleted files successfully on attempt ${attempt}: ${entry.downloadDir}`);
+                    const filePath = path.join(entry.downloadDir, entry.fileName);
+                    if (fs.existsSync(filePath)) {
+                        fs.rmSync(filePath, { force: true });
+                        console.log(`[Downloads] Deleted single file: ${filePath}`);
+                    }
+                    if (entry.subtitles) {
+                        entry.subtitles.forEach(sub => {
+                            if (sub.path && fs.existsSync(sub.path)) {
+                                fs.rmSync(sub.path, { force: true });
+                            }
+                        });
                     }
                 } catch (e) {
-                    console.log(`[Downloads] Attempt ${attempt} failed to delete files for ${hash}:`, e.message);
-                    if (attempt < 5) {
-                        const delay = attempt * 1000;
-                        console.log(`[Downloads] Scheduling deletion retry attempt ${attempt + 1} in ${delay}ms`);
-                        setTimeout(() => attemptDelete(attempt + 1), delay);
-                    }
+                    console.log(`[Downloads] Failed to delete specific files for ${id}:`, e.message);
                 }
-            };
-            attemptDelete(1);
+            } else {
+                const attemptDelete = (attempt) => {
+                    try {
+                        if (fs.existsSync(entry.downloadDir)) {
+                            fs.rmSync(entry.downloadDir, { recursive: true, force: true });
+                            console.log(`[Downloads] Deleted folder successfully on attempt ${attempt}: ${entry.downloadDir}`);
+                        }
+                    } catch (e) {
+                        console.log(`[Downloads] Attempt ${attempt} failed to delete files for ${id}:`, e.message);
+                        if (attempt < 5) {
+                            const delay = attempt * 1000;
+                            console.log(`[Downloads] Scheduling deletion retry attempt ${attempt + 1} in ${delay}ms`);
+                            setTimeout(() => attemptDelete(attempt + 1), delay);
+                        }
+                    }
+                };
+                attemptDelete(1);
+            }
         }
     };
 
@@ -1593,35 +1697,42 @@ serverApp.get('/download/delete/:hash', (req, res) => {
         if (active.engine) {
             try {
                 active.engine.destroy();
-                console.log(`[Downloads] Engine destroyed successfully for hash: ${hash}`);
+                console.log(`[Downloads] Engine destroyed successfully for hash: ${id}`);
             } catch (e) {
                 console.log(`[Downloads] Error destroying engine:`, e.message);
             }
         }
-        activeDownloads.delete(hash);
+        activeDownloads.delete(downloadId);
     }
 
     // Always delete files from disk
     deleteFiles();
 
     // Remove from meta
-    delete allMeta.downloads[hash];
+    delete allMeta.downloads[downloadId];
     saveDownloadsMeta(allMeta);
 
-    res.json({ status: 'deleted', hash });
+    res.json({ status: 'deleted', hash: entry ? entry.hash : id, id: downloadId });
 });
 
-serverApp.get('/download/open/:hash', (req, res) => {
-    const { hash } = req.params;
+serverApp.get('/download/open/:id', (req, res) => {
+    const { id } = req.params;
     const allMeta = loadDownloadsMeta();
-    const entry = allMeta.downloads[hash];
+    let entry = allMeta.downloads[id];
+    if (!entry) {
+        for (const [key, value] of Object.entries(allMeta.downloads)) {
+            if (value.hash === id) {
+                entry = value;
+                break;
+            }
+        }
+    }
     if (!entry || !entry.downloadDir) {
         return res.status(404).json({ error: 'Download not found' });
     }
 
-    // Find the actual video file in the download directory (including subfolders)
     try {
-        const videoFilePath = findVideoFile(entry.downloadDir);
+        const videoFilePath = findExactVideoFile(entry.downloadDir, entry.fileName);
         if (videoFilePath) {
             shell.showItemInFolder(videoFilePath);
         } else {
@@ -1631,5 +1742,5 @@ serverApp.get('/download/open/:hash', (req, res) => {
         shell.openPath(entry.downloadDir);
     }
 
-    res.json({ status: 'opened', hash });
+    res.json({ status: 'opened', hash: entry.hash, id: entry.id });
 });
