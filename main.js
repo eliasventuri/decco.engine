@@ -148,6 +148,37 @@ function startDownload(hash, title, imdbId, season, episode, fileIdx) {
     const downloadDir = path.join(DOWNLOADS_DIR, hash.substring(0, 16));
     if (!fs.existsSync(downloadDir)) fs.mkdirSync(downloadDir, { recursive: true });
 
+    // Check if there is an active streaming engine for this hash
+    const streamingEngine = activeEngines.get(hash);
+    let wasStreaming = false;
+    if (streamingEngine && !streamingEngine.isMock) {
+        console.log(`[Downloads] Found active streaming engine for ${hash}. Upgrading to permanent download...`);
+        wasStreaming = true;
+        
+        // Get the source path of the streaming engine before destroying it
+        const srcPath = streamingEngine.path || (streamingEngine.torrent && streamingEngine.torrent.path);
+        
+        try {
+            // Destroy the streaming engine to release file locks on the cache
+            streamingEngine.destroy();
+            activeEngines.delete(hash);
+            console.log(`[Downloads] Active streaming engine destroyed for transition.`);
+        } catch (e) {
+            console.error(`[Downloads] Error destroying streaming engine for transition:`, e.message);
+        }
+
+        // Copy already cached files to the permanent download directory so progress is preserved
+        if (srcPath && fs.existsSync(srcPath)) {
+            try {
+                console.log(`[Downloads] Copying cached files from "${srcPath}" to "${downloadDir}"...`);
+                fs.cpSync(srcPath, downloadDir, { recursive: true, force: true, errorOnExist: false });
+                console.log(`[Downloads] Copied cached files successfully.`);
+            } catch (e) {
+                console.error(`[Downloads] Failed to copy cached files:`, e.message);
+            }
+        }
+    }
+
     console.log(`[Downloads] Starting download: ${title} (${hash})`);
 
     const engine = torrentStream(`magnet:?xt=urn:btih:${hash}&tr=${TRACKERS.map(encodeURIComponent).join('&tr=')}`, {
@@ -156,6 +187,24 @@ function startDownload(hash, title, imdbId, season, episode, fileIdx) {
         trackers: TRACKERS,
         connections: 100
     });
+
+    // If it was streaming, immediately register the new download engine in activeEngines
+    // so any incoming playback requests (/proxy, /status) seamlessly route to it.
+    if (wasStreaming) {
+        engine.isMock = false;
+        engine.requestedFileIdx = fileIdx;
+        engine.requestedSeason = season;
+        engine.requestedEpisode = episode;
+        engine.metadataReady = false;
+        engine.status = 'loading';
+        
+        engine.on('ready', () => {
+            engine.metadataReady = true;
+            engine.status = 'ready';
+        });
+        
+        activeEngines.set(hash, engine);
+    }
 
     const existingMeta = loadDownloadsMeta().downloads[hash];
     const isAlreadyCompleted = existingMeta && existingMeta.status === 'completed';
