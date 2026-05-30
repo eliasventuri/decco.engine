@@ -7,7 +7,7 @@ const fs = require('fs');
 const ffmpeg = require('fluent-ffmpeg');
 const { autoUpdater } = require('electron-updater');
 
-const PORT = 8888;
+const PORT = 18888;
 const DOWNLOAD_PATH = path.join(app.getPath('userData'), 'downloads');
 const SEGMENT_DURATION = 10;
 const logFile = fs.createWriteStream(path.join(DOWNLOAD_PATH, 'decco-engine.log'), { flags: 'a' });
@@ -896,7 +896,41 @@ else {
             }
         } catch (e) { console.log('[Tray] Error creating tray:', e.message); }
         if (process.platform === 'darwin') app.dock.hide();
-        try { serverApp.listen(PORT, "127.0.0.1"); } catch (e) { }
+        
+        // Start the server with robust fallback bindings (IPv4/IPv6 dual-stack)
+        const startServer = () => {
+            const server = serverApp.listen(PORT, "::", () => {
+                console.log(`[Server] Express server listening on all interfaces (IPv4/IPv6 dual-stack) on port ${PORT}`);
+            });
+
+            server.on('error', (err) => {
+                console.error(`[Server] Failed to bind to '::' on port ${PORT}:`, err.message);
+                if (err.code === 'EADDRNOTAVAIL' || err.code === 'EINVAL') {
+                    console.log('[Server] IPv6 not supported or disabled. Retrying with IPv4 "0.0.0.0"...');
+                    const fallbackServer = serverApp.listen(PORT, "0.0.0.0", () => {
+                        console.log(`[Server] Express server listening on all IPv4 interfaces on port ${PORT}`);
+                    });
+                    fallbackServer.on('error', (err2) => {
+                        console.error(`[Server] Failed to bind to '0.0.0.0' on port ${PORT}:`, err2.message);
+                        console.log('[Server] Retrying with explicit loopback "127.0.0.1"...');
+                        const ultimateServer = serverApp.listen(PORT, "127.0.0.1", () => {
+                            console.log(`[Server] Express server listening on explicit IPv4 loopback 127.0.0.1:${PORT}`);
+                        });
+                        ultimateServer.on('error', (err3) => {
+                            console.error(`[Server] Ultimate fallback to 127.0.0.1 failed:`, err3.message);
+                        });
+                    });
+                } else if (err.code === 'EADDRINUSE') {
+                    console.log(`[Server] Port ${PORT} is already in use. An instance of Decco Engine may already be running.`);
+                }
+            });
+        };
+
+        try {
+            startServer();
+        } catch (e) {
+            console.error('[Server] Critical exception starting server:', e.message);
+        }
 
         // Start seeding restoration, download restoration, and cache cleanup
         setTimeout(() => {
@@ -1044,6 +1078,23 @@ function serveLocalFile(filePath, req, res) {
 
 const serverApp = express();
 serverApp.use(cors());
+
+// Security middleware: only allow requests from loopback interfaces (localhost/127.0.0.1/::1)
+serverApp.use((req, res, next) => {
+    const remoteIp = req.socket.remoteAddress;
+    if (!remoteIp) {
+        return res.status(403).send('Access denied: unidentified connection');
+    }
+    const isLoopback = remoteIp === '127.0.0.1' || 
+                       remoteIp === '::1' || 
+                       remoteIp === '::ffff:127.0.0.1' || 
+                       remoteIp.endsWith('127.0.0.1');
+    if (!isLoopback) {
+        console.warn(`[Security] Blocked non-local request from ${remoteIp}`);
+        return res.status(403).send('Access denied: connections allowed only from localhost');
+    }
+    next();
+});
 
 // INTERNAL HTTP PROXY (The "Smart" Layer)
 // This translates FFmpeg's Rage requests into Torrent byte reads
