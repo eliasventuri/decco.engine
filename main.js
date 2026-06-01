@@ -1252,21 +1252,21 @@ function serveLocalFile(filePath, req, res) {
 
 const serverApp = express();
 
-// Enable CORS and Private Network Access (PNA) preflight headers for secure contexts
-serverApp.use(cors());
+// Enable Private Network Access (PNA) and CORS preflight headers for secure contexts
 serverApp.use((req, res, next) => {
     if (req.headers['access-control-request-private-network']) {
         res.setHeader('Access-Control-Allow-Private-Network', 'true');
     }
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,DELETE,OPTIONS');
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Range, Authorization');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Range, Authorization, X-Requested-With');
     
     if (req.method === 'OPTIONS') {
         return res.sendStatus(200);
     }
     next();
 });
+serverApp.use(cors());
 
 // Security middleware: only allow requests from loopback interfaces (localhost/127.0.0.1/::1)
 serverApp.use((req, res, next) => {
@@ -1277,6 +1277,8 @@ serverApp.use((req, res, next) => {
     const isLoopback = remoteIp === '127.0.0.1' || 
                        remoteIp === '::1' || 
                        remoteIp === '::ffff:127.0.0.1' || 
+                       remoteIp.startsWith('127.') || 
+                       remoteIp.startsWith('::ffff:127.') ||
                        remoteIp.endsWith('127.0.0.1');
     if (!isLoopback) {
         console.warn(`[Security] Blocked non-local request from ${remoteIp}`);
