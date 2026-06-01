@@ -807,13 +807,51 @@ function getEngine(hash, fileIdx = null, season = null, episode = null) {
                 dlEngine.requestedSeason = season;
                 dlEngine.requestedEpisode = episode;
                 
+                // Helper to probe duration and codec for the active downloading torrent when played
+                const probeDl = () => {
+                    if (dlEngine.duration && dlEngine.videoCodec) return; // Already probed
+                    if (dlEngine.isProbing) return;
+                    dlEngine.isProbing = true;
+                    
+                    ffmpeg.ffprobe(`http://127.0.0.1:${PORT}/proxy/${hash}`, (err, metadata) => {
+                        dlEngine.isProbing = false;
+                        if (!err && metadata.format && metadata.format.duration) {
+                            dlEngine.duration = metadata.format.duration;
+                            
+                            const videoStream = metadata.streams.find(s => s.codec_type === 'video');
+                            if (videoStream) {
+                                dlEngine.videoCodec = videoStream.codec_name;
+                                console.log(`[DL Engine] Codec Detected: ${dlEngine.videoCodec}`);
+                            }
+                            console.log(`[DL Engine] Precise duration found: ${dlEngine.duration}s`);
+                            
+                            // Save duration in persistent downloads metadata
+                            try {
+                                const freshMeta = loadDownloadsMeta();
+                                const savedItem = freshMeta.downloads[downloadId];
+                                if (savedItem) {
+                                    savedItem.duration = dlEngine.duration;
+                                    saveDownloadsMeta(freshMeta);
+                                    console.log(`[DL Engine] Saved precise duration to downloads database for ${downloadId}`);
+                                }
+                            } catch (saveErr) {
+                                console.error('[DL Engine] Failed to save duration to database:', saveErr.message);
+                            }
+                        } else if (dlEngine.status === 'ready') {
+                            setTimeout(probeDl, 5000);
+                        }
+                    });
+                };
+                
                 if (dlEngine.videoFile) {
                     dlEngine.metadataReady = true;
                     dlEngine.status = 'ready';
+                    probeDl();
                 } else {
                     dlEngine.on('ready', () => {
                         dlEngine.metadataReady = true;
                         dlEngine.status = 'ready';
+                        probeDl();
                     });
                 }
                 
