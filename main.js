@@ -1052,34 +1052,34 @@ else {
             console.log(`[Server] Registered active port: ${port}. Primary engine port is now: ${PORT}`);
         };
 
-        // Start the server with robust fallback bindings (IPv4/IPv6 dual-stack) on multiple ports for backwards compatibility
+        // Start the server by binding primarily to "127.0.0.1" (explicit loopback) to prevent Windows Firewall alerts
         const startServerOnPort = (port) => {
             const http = require('http');
             const server = http.createServer(serverApp);
 
-            server.listen(port, "::", () => {
-                console.log(`[Server] Express server listening on port ${port} (IPv4/IPv6 dual-stack)`);
+            server.listen(port, "127.0.0.1", () => {
+                console.log(`[Server] Express server listening on explicit loopback 127.0.0.1:${port} (Firewall-safe)`);
                 registerActivePort(port);
             });
 
             server.on('error', (err) => {
-                console.error(`[Server] Failed to bind to '::' on port ${port}:`, err.message);
+                console.error(`[Server] Failed to bind to '127.0.0.1' on port ${port}:`, err.message);
                 if (err.code === 'EADDRNOTAVAIL' || err.code === 'EINVAL') {
-                    console.log(`[Server] IPv6 not supported. Retrying with IPv4 "0.0.0.0" on port ${port}...`);
+                    console.log(`[Server] Loopback not available. Trying dual-stack "::" on port ${port}...`);
                     const fallbackServer = http.createServer(serverApp);
-                    fallbackServer.listen(port, "0.0.0.0", () => {
-                        console.log(`[Server] Express server listening on port ${port} (all IPv4 interfaces)`);
+                    fallbackServer.listen(port, "::", () => {
+                        console.log(`[Server] Express server listening on port ${port} (IPv4/IPv6 dual-stack)`);
                         registerActivePort(port);
                     });
                     fallbackServer.on('error', (err2) => {
-                        console.error(`[Server] Failed to bind to '0.0.0.0' on port ${port}:`, err2.message);
-                        console.log(`[Server] Retrying with explicit loopback "127.0.0.1" on port ${port}...`);
+                        console.error(`[Server] Failed to bind to '::' on port ${port}:`, err2.message);
+                        console.log(`[Server] Retrying with "0.0.0.0" on port ${port}...`);
                         const ultimateServer = http.createServer(serverApp);
                         ultimateServer.on('error', (err3) => {
-                            console.error(`[Server] Ultimate fallback to 127.0.0.1 failed on port ${port}:`, err3.message);
+                            console.error(`[Server] Ultimate fallback to 0.0.0.0 failed on port ${port}:`, err3.message);
                         });
-                        ultimateServer.listen(port, "127.0.0.1", () => {
-                            console.log(`[Server] Express server listening on explicit loopback 127.0.0.1:${port}`);
+                        ultimateServer.listen(port, "0.0.0.0", () => {
+                            console.log(`[Server] Express server listening on port ${port} (all IPv4 interfaces)`);
                             registerActivePort(port);
                         });
                     });
@@ -1251,7 +1251,22 @@ function serveLocalFile(filePath, req, res) {
 }
 
 const serverApp = express();
+
+// Enable CORS and Private Network Access (PNA) preflight headers for secure contexts
 serverApp.use(cors());
+serverApp.use((req, res, next) => {
+    if (req.headers['access-control-request-private-network']) {
+        res.setHeader('Access-Control-Allow-Private-Network', 'true');
+    }
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,DELETE,OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Range, Authorization');
+    
+    if (req.method === 'OPTIONS') {
+        return res.sendStatus(200);
+    }
+    next();
+});
 
 // Security middleware: only allow requests from loopback interfaces (localhost/127.0.0.1/::1)
 serverApp.use((req, res, next) => {
