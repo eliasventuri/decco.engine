@@ -261,6 +261,21 @@ function startDownload(hash, title, imdbId, season, episode, fileIdx) {
                 console.log(`[Downloads] Copying cached files from "${srcPath}" to "${downloadDir}"...`);
                 fs.cpSync(srcPath, downloadDir, { recursive: true, force: true, errorOnExist: false });
                 console.log(`[Downloads] Copied cached files successfully.`);
+
+                // Clean up the temporary streaming files now that they are copied to completed-downloads
+                try {
+                    fs.rmSync(srcPath, { recursive: true, force: true });
+                    console.log(`[Downloads] Cleaned up temporary stream files from "${srcPath}"`);
+                } catch (rmErr) {
+                    console.error(`[Downloads] Failed to delete temporary stream files:`, rmErr.message);
+                }
+
+                // Also remove the torrent from the streaming cache metadata since it is now a permanent download
+                try {
+                    removeTorrentFromCache(hash);
+                } catch (metaErr) {
+                    console.error(`[Downloads] Failed to remove torrent from cache metadata:`, metaErr.message);
+                }
             } catch (e) {
                 console.error(`[Downloads] Failed to copy cached files:`, e.message);
             }
