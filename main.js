@@ -6,6 +6,7 @@ const cors = require('cors');
 const fs = require('fs');
 const ffmpeg = require('fluent-ffmpeg');
 const { autoUpdater } = require('electron-updater');
+const { Readable } = require('stream');
 
 let PORT = 18889;
 const DOWNLOAD_PATH = path.join(app.getPath('userData'), 'downloads');
@@ -1303,6 +1304,43 @@ function serveLocalFile(filePath, req, res) {
     });
 }
 
+function isAllowedLiveProxyProtocol(value) {
+    return value === 'http:' || value === 'https:';
+}
+
+function buildEngineLiveProxyUrl(target) {
+    return `http://127.0.0.1:${PORT}/live/proxy?url=${encodeURIComponent(target)}`;
+}
+
+function absolutizeLiveProxyLine(line, baseUrl) {
+    try {
+        return new URL(line, baseUrl).toString();
+    } catch {
+        return line;
+    }
+}
+
+function rewriteLiveManifest(manifest, baseUrl) {
+    return manifest
+        .split('\n')
+        .map((rawLine) => {
+            const line = rawLine.trim();
+
+            if (!line) return rawLine;
+            if (line.startsWith('#EXT-X-KEY')) {
+                return rawLine.replace(/URI="([^"]+)"/, (_, uri) => {
+                    const absolute = absolutizeLiveProxyLine(uri, baseUrl);
+                    return `URI="${buildEngineLiveProxyUrl(absolute)}"`;
+                });
+            }
+            if (line.startsWith('#')) return rawLine;
+
+            const absolute = absolutizeLiveProxyLine(line, baseUrl);
+            return buildEngineLiveProxyUrl(absolute);
+        })
+        .join('\n');
+}
+
 const serverApp = express();
 
 // Enable Private Network Access (PNA) and CORS preflight headers for secure contexts
@@ -1400,6 +1438,88 @@ serverApp.get('/proxy/:hash', (req, res) => {
 
     // Ensure stream is destroyed if request is aborted (crucial for FFmpeg seeking)
     req.on('close', () => stream.destroy());
+});
+
+// LIVE TV PROXY
+// Used only for public http(s) IPTV sources so the browser can read them
+// through the local Decco Engine without routing traffic via production.
+serverApp.get('/live/proxy', async (req, res) => {
+    const target = req.query.url;
+    if (!target || typeof target !== 'string') {
+        return res.status(400).json({ error: 'Missing url parameter' });
+    }
+
+    let parsed;
+    try {
+        parsed = new URL(target);
+    } catch {
+        return res.status(400).json({ error: 'Invalid url parameter' });
+    }
+
+    if (!isAllowedLiveProxyProtocol(parsed.protocol)) {
+        return res.status(400).json({ error: 'Unsupported protocol' });
+    }
+
+    try {
+        const upstream = await fetch(parsed.toString(), {
+            headers: {
+                'User-Agent': req.headers['user-agent'] || 'Mozilla/5.0 Decco Engine Live Proxy',
+                'Accept': req.headers.accept || '*/*',
+            },
+            redirect: 'follow',
+        });
+
+        if (!upstream.ok) {
+            return res.status(upstream.status).json({ error: `Upstream request failed with ${upstream.status}` });
+        }
+
+        const contentType = upstream.headers.get('content-type') || '';
+        const isManifest =
+            parsed.pathname.endsWith('.m3u8') ||
+            contentType.includes('application/vnd.apple.mpegurl') ||
+            contentType.includes('application/x-mpegurl');
+
+        res.setHeader('Cache-Control', 'no-store');
+
+        if (isManifest) {
+            const manifest = await upstream.text();
+            const rewritten = rewriteLiveManifest(manifest, parsed.toString());
+            res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
+            return res.status(200).send(rewritten);
+        }
+
+        if (contentType) {
+            res.setHeader('Content-Type', contentType);
+        }
+
+        upstream.headers.forEach((value, key) => {
+            const lower = key.toLowerCase();
+            if (lower === 'content-type' || lower === 'content-length' || lower === 'content-encoding' || lower === 'transfer-encoding') {
+                return;
+            }
+            res.setHeader(key, value);
+        });
+
+        const bodyStream = upstream.body ? Readable.fromWeb(upstream.body) : null;
+        if (!bodyStream) {
+            return res.status(502).json({ error: 'Upstream body unavailable' });
+        }
+
+        bodyStream.on('error', (error) => {
+            console.error('[Live Proxy] Stream error:', error.message);
+            if (!res.headersSent) {
+                res.status(502).end();
+            } else {
+                res.end();
+            }
+        });
+
+        req.on('close', () => bodyStream.destroy());
+        bodyStream.pipe(res);
+    } catch (error) {
+        console.error('[Live Proxy] Failed:', error.message);
+        return res.status(502).json({ error: 'Failed to proxy live stream', details: error.message });
+    }
 });
 
 // HTTP Trigger to start engine (Bypasses custom protocol issues in Dev)
