@@ -1327,13 +1327,15 @@ function rewriteLiveManifest(manifest, baseUrl) {
             const line = rawLine.trim();
 
             if (!line) return rawLine;
-            if (line.startsWith('#EXT-X-KEY')) {
-                return rawLine.replace(/URI="([^"]+)"/, (_, uri) => {
-                    const absolute = absolutizeLiveProxyLine(uri, baseUrl);
-                    return `URI="${buildEngineLiveProxyUrl(absolute)}"`;
-                });
+            if (line.startsWith('#')) {
+                if (rawLine.includes('URI="')) {
+                    return rawLine.replace(/URI="([^"]+)"/g, (_, uri) => {
+                        const absolute = absolutizeLiveProxyLine(uri, baseUrl);
+                        return `URI="${buildEngineLiveProxyUrl(absolute)}"`;
+                    });
+                }
+                return rawLine;
             }
-            if (line.startsWith('#')) return rawLine;
 
             const absolute = absolutizeLiveProxyLine(line, baseUrl);
             return buildEngineLiveProxyUrl(absolute);
