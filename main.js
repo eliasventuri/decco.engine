@@ -1305,7 +1305,7 @@ function serveLocalFile(filePath, req, res) {
 }
 
 function isAllowedLiveProxyProtocol(value) {
-    return value === 'http:' || value === 'https:';
+    return value === 'http:';
 }
 
 function buildEngineLiveProxyUrl(target, req) {
