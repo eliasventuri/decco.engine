@@ -1308,8 +1308,9 @@ function isAllowedLiveProxyProtocol(value) {
     return value === 'http:' || value === 'https:';
 }
 
-function buildEngineLiveProxyUrl(target) {
-    return `http://127.0.0.1:${PORT}/live/proxy?url=${encodeURIComponent(target)}`;
+function buildEngineLiveProxyUrl(target, req) {
+    const host = req && req.headers && req.headers.host ? req.headers.host : `127.0.0.1:${PORT}`;
+    return `http://${host}/live/proxy?url=${encodeURIComponent(target)}`;
 }
 
 function absolutizeLiveProxyLine(line, baseUrl) {
@@ -1320,7 +1321,7 @@ function absolutizeLiveProxyLine(line, baseUrl) {
     }
 }
 
-function rewriteLiveManifest(manifest, baseUrl) {
+function rewriteLiveManifest(manifest, baseUrl, req) {
     return manifest
         .split('\n')
         .map((rawLine) => {
@@ -1331,14 +1332,14 @@ function rewriteLiveManifest(manifest, baseUrl) {
                 if (rawLine.includes('URI="')) {
                     return rawLine.replace(/URI="([^"]+)"/g, (_, uri) => {
                         const absolute = absolutizeLiveProxyLine(uri, baseUrl);
-                        return `URI="${buildEngineLiveProxyUrl(absolute)}"`;
+                        return `URI="${buildEngineLiveProxyUrl(absolute, req)}"`;
                     });
                 }
                 return rawLine;
             }
 
             const absolute = absolutizeLiveProxyLine(line, baseUrl);
-            return buildEngineLiveProxyUrl(absolute);
+            return buildEngineLiveProxyUrl(absolute, req);
         })
         .join('\n');
 }
@@ -1485,7 +1486,7 @@ serverApp.get('/live/proxy', async (req, res) => {
 
         if (isManifest) {
             const manifest = await upstream.text();
-            const rewritten = rewriteLiveManifest(manifest, parsed.toString());
+            const rewritten = rewriteLiveManifest(manifest, parsed.toString(), req);
             res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
             return res.status(200).send(rewritten);
         }
