@@ -1215,7 +1215,7 @@ else {
         setInterval(() => {
             console.log('[Updater] Periodic update check...');
             autoUpdater.checkForUpdatesAndNotify();
-        }, 1000 * 60 * 60 * 4); // Check every 4 hours
+        }, 1000 * 60 * 60 * 1); // Check every 1 hour
     });
 }
 
@@ -1305,7 +1305,7 @@ function serveLocalFile(filePath, req, res) {
 }
 
 function isAllowedLiveProxyProtocol(value) {
-    return value === 'http:';
+    return value === 'http:' || value === 'https:';
 }
 
 function buildEngineLiveProxyUrl(target, req) {
