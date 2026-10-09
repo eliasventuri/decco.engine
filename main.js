@@ -22,6 +22,57 @@ if (!fs.existsSync(DOWNLOADS_DIR)) fs.mkdirSync(DOWNLOADS_DIR, { recursive: true
 
 const activeDownloads = new Map(); // hash -> { engine, meta, interval }
 let downloadsWindow = null;
+const sseDownloadClients = new Set();
+
+function getDownloadsPayload() {
+    const result = [];
+    const allMeta = loadDownloadsMeta();
+    for (const [downloadId, entry] of Object.entries(allMeta.downloads)) {
+        const active = activeDownloads.get(downloadId);
+        if (active) {
+            result.push({
+                ...active.meta,
+                progress: active.meta.progress,
+                speed: active.meta.speed,
+                peers: active.meta.peers,
+                eta: active.meta.eta ?? null,
+                isStalled: active.meta.isStalled ?? false,
+                downloadedBytes: active.meta.downloadedBytes ?? Math.round((active.meta.progress || 0) * (active.meta.fileSize || 0))
+            });
+        } else {
+            result.push({
+                ...entry,
+                progress: entry.status === 'completed' ? 1.0 : 0,
+                speed: 0,
+                peers: 0,
+                eta: null,
+                isStalled: false,
+                downloadedBytes: entry.status === 'completed' ? (entry.fileSize || 0) : 0
+            });
+        }
+    }
+    return { downloads: result };
+}
+
+let lastBroadcastPayload = '';
+function broadcastDownloadEvents() {
+    if (sseDownloadClients.size === 0) return;
+    try {
+        const payload = JSON.stringify(getDownloadsPayload());
+        if (payload === lastBroadcastPayload) return;
+        lastBroadcastPayload = payload;
+        const msg = `data: ${payload}\n\n`;
+        for (const client of sseDownloadClients) {
+            try {
+                client.write(msg);
+            } catch (err) {
+                sseDownloadClients.delete(client);
+            }
+        }
+    } catch (e) {
+        console.error('[SSE] Broadcast error:', e.message);
+    }
+}
 
 let tray = null;
 const activeEngines = new Map();
@@ -84,9 +135,17 @@ function loadDownloadsMeta() {
 
 function saveDownloadsMeta(meta) {
     try {
-        fs.writeFileSync(DOWNLOADS_META_PATH, JSON.stringify(meta, null, 2));
+        const tempPath = `${DOWNLOADS_META_PATH}.tmp.${Date.now()}`;
+        fs.writeFileSync(tempPath, JSON.stringify(meta, null, 2));
+        fs.renameSync(tempPath, DOWNLOADS_META_PATH);
     } catch (e) {
-        console.log('[Downloads] Error saving meta:', e.message);
+        console.log('[Downloads] Error saving meta atomically:', e.message);
+        // Fallback standard write if rename fails
+        try {
+            fs.writeFileSync(DOWNLOADS_META_PATH, JSON.stringify(meta, null, 2));
+        } catch (err) {
+            console.log('[Downloads] Fallback save failed:', err.message);
+        }
     }
 }
 
@@ -380,36 +439,65 @@ function startDownload(hash, title, imdbId, season, episode, fileIdx) {
                 persistDownloadMeta(downloadId, meta);
             });
 
+        // Stalled detection timer (if no peers or metadata for 45s)
+        let stalledTimeout = setTimeout(() => {
+            if (meta.status === 'downloading' && meta.speed === 0 && meta.peers === 0 && meta.progress === 0) {
+                meta.isStalled = true;
+                broadcastDownloadEvents();
+            }
+        }, 45000);
+
         // Progress polling
         const interval = setInterval(() => {
             const progress = getFileProgress(engine, file);
             meta.progress = progress;
             meta.speed = engine.swarm ? engine.swarm.downloadSpeed() : 0;
             meta.peers = engine.swarm ? engine.swarm.wires.length : 0;
+            meta.downloadedBytes = Math.round(progress * (meta.fileSize || 0));
+
+            if (meta.speed > 0 || meta.peers > 0 || progress > 0) {
+                meta.isStalled = false;
+            }
+
+            // Estimate Remaining Time (ETA in seconds)
+            if (meta.speed > 0 && meta.fileSize > 0 && progress < 1.0) {
+                const remainingBytes = meta.fileSize - meta.downloadedBytes;
+                meta.eta = Math.max(0, Math.round(remainingBytes / meta.speed));
+            } else {
+                meta.eta = null;
+            }
 
             if (progress >= 1.0 && meta.status === 'downloading') {
                 meta.status = 'completed';
                 meta.completedAt = Date.now();
                 meta.progress = 1.0;
+                meta.eta = 0;
+                if (stalledTimeout) clearTimeout(stalledTimeout);
                 clearInterval(interval);
                 console.log(`[Downloads] COMPLETED: ${meta.title}`);
                 persistDownloadMeta(downloadId, meta);
+                broadcastDownloadEvents();
 
                 // Clean up unwanted video files from multipack/season-pack torrents.
                 // BitTorrent pieces can span file boundaries, so downloading one episode
                 // may cause adjacent episodes' data to also be written to disk.
                 cleanupUnwantedFiles(downloadDir, file.name);
+            } else {
+                broadcastDownloadEvents();
             }
         }, 1000);
 
-        activeDownloads.set(downloadId, { engine, meta, interval, file });
+        activeDownloads.set(downloadId, { engine, meta, interval, file, stalledTimeout });
         persistDownloadMeta(downloadId, meta);
+        broadcastDownloadEvents();
     });
 
     engine.on('error', (err) => {
         meta.status = 'error';
+        meta.lastError = err.message;
         console.error(`[Downloads] Error for ${hash}:`, err.message);
         persistDownloadMeta(downloadId, meta);
+        broadcastDownloadEvents();
     });
 
     activeDownloads.set(downloadId, { engine, meta, interval: null });
@@ -1794,31 +1882,36 @@ serverApp.get('/download/start', (req, res) => {
 });
 
 serverApp.get('/download/list', (req, res) => {
-    const result = [];
-    const allMeta = loadDownloadsMeta();
+    res.json(getDownloadsPayload());
+});
 
-    // Merge persisted meta with live data from active downloads
-    for (const [downloadId, entry] of Object.entries(allMeta.downloads)) {
-        const active = activeDownloads.get(downloadId);
-        if (active) {
-            result.push({
-                ...active.meta,
-                progress: active.meta.progress,
-                speed: active.meta.speed,
-                peers: active.meta.peers
-            });
-        } else {
-            // Not actively downloading (completed or stopped)
-            result.push({
-                ...entry,
-                progress: entry.status === 'completed' ? 1.0 : 0,
-                speed: 0,
-                peers: 0
-            });
+serverApp.get('/download/events', (req, res) => {
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache, no-transform');
+    res.setHeader('Connection', 'keep-alive');
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.flushHeaders?.();
+
+    // Send initial snapshot immediately
+    const initial = `data: ${JSON.stringify(getDownloadsPayload())}\n\n`;
+    res.write(initial);
+
+    sseDownloadClients.add(res);
+
+    // Heartbeat ping every 15s to keep connection alive through proxies
+    const heartbeat = setInterval(() => {
+        try {
+            res.write(': keepalive\n\n');
+        } catch (e) {
+            clearInterval(heartbeat);
+            sseDownloadClients.delete(res);
         }
-    }
+    }, 15000);
 
-    res.json({ downloads: result });
+    req.on('close', () => {
+        clearInterval(heartbeat);
+        sseDownloadClients.delete(res);
+    });
 });
 
 serverApp.get('/download/pause/:id', (req, res) => {
@@ -1843,6 +1936,7 @@ serverApp.get('/download/pause/:id', (req, res) => {
     active.meta.status = 'paused';
     persistDownloadMeta(downloadId, active.meta);
     activeDownloads.delete(downloadId);
+    broadcastDownloadEvents();
 
     res.json({ status: 'paused', hash: active.meta.hash, id: downloadId });
 });
@@ -1862,6 +1956,7 @@ serverApp.get('/download/resume/:id', (req, res) => {
     if (!saved) return res.status(404).json({ error: 'Download not found in meta' });
 
     startDownload(saved.hash, saved.title, saved.imdbId, saved.season, saved.episode, saved.fileIdx);
+    broadcastDownloadEvents();
     res.json({ status: 'resumed', hash: saved.hash, id: saved.id });
 });
 
@@ -1942,6 +2037,9 @@ serverApp.get('/download/delete/:id', (req, res) => {
         if (active.interval) {
             try { clearInterval(active.interval); } catch (e) {}
         }
+        if (active.stalledTimeout) {
+            try { clearTimeout(active.stalledTimeout); } catch (e) {}
+        }
         if (active.engine) {
             try {
                 active.engine.destroy();
@@ -1959,6 +2057,7 @@ serverApp.get('/download/delete/:id', (req, res) => {
     // Remove from meta
     delete allMeta.downloads[downloadId];
     saveDownloadsMeta(allMeta);
+    broadcastDownloadEvents();
 
     res.json({ status: 'deleted', hash: entry ? entry.hash : id, id: downloadId });
 });
