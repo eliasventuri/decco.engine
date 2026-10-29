@@ -78,6 +78,16 @@ let tray = null;
 const activeEngines = new Map();
 let activeStreamingHash = null;
 let autoResumeTimeout = null;
+const stopGraceTimeouts = new Map();
+
+function cancelStopGraceTimeout(hash) {
+    if (!hash) return;
+    const normalized = String(hash).toLowerCase();
+    if (stopGraceTimeouts.has(normalized)) {
+        clearTimeout(stopGraceTimeouts.get(normalized));
+        stopGraceTimeouts.delete(normalized);
+    }
+}
 
 function isEngineSharedWithDownloads(hash, engine) {
     for (const activeDl of activeDownloads.values()) {
@@ -89,6 +99,7 @@ function isEngineSharedWithDownloads(hash, engine) {
 }
 
 function pauseCompetingStreamsAndDownloads(targetHash, targetDownloadId = null) {
+    cancelStopGraceTimeout(targetHash);
     activeStreamingHash = targetHash;
     if (autoResumeTimeout) {
         clearTimeout(autoResumeTimeout);
@@ -98,6 +109,7 @@ function pauseCompetingStreamsAndDownloads(targetHash, targetDownloadId = null) 
     // 1. Stop any other active streaming engines (previous movies/series left mid-watch)
     for (const [otherHash, otherEngine] of activeEngines.entries()) {
         if (otherHash === targetHash) continue;
+        cancelStopGraceTimeout(otherHash);
 
         if (isEngineSharedWithDownloads(otherHash, otherEngine)) {
             activeEngines.delete(otherHash);
@@ -140,44 +152,55 @@ function pauseCompetingStreamsAndDownloads(targetHash, targetDownloadId = null) 
 }
 
 function stopStreamAndResumeAutoPaused(stoppedHash) {
-    if (stoppedHash && activeEngines.has(stoppedHash)) {
-        const eng = activeEngines.get(stoppedHash);
-        if (!isEngineSharedWithDownloads(stoppedHash, eng)) {
-            try {
-                if (!eng.isMock && typeof eng.destroy === 'function') {
-                    eng.destroy();
-                    console.log(`[Engine] Stopped streaming engine for ${stoppedHash} (playback exited)`);
-                }
-            } catch (e) {}
-            activeEngines.delete(stoppedHash);
-        }
-    }
+    if (!stoppedHash) return;
+    const normalized = String(stoppedHash).toLowerCase();
+    cancelStopGraceTimeout(normalized);
 
-    if (!stoppedHash || activeStreamingHash === stoppedHash) {
-        activeStreamingHash = null;
-    }
+    // Debounce stop by 6s so React StrictMode remounts or out-of-order /stop vs /start
+    // requests never destroy the active stream the user is currently trying to play.
+    const timer = setTimeout(() => {
+        stopGraceTimeouts.delete(normalized);
 
-    // Wait 3s before auto-resuming background downloads in case user is switching to another episode/movie
-    if (autoResumeTimeout) clearTimeout(autoResumeTimeout);
-    autoResumeTimeout = setTimeout(() => {
-        autoResumeTimeout = null;
-        if (activeStreamingHash) return;
-
-        const allMeta = loadDownloadsMeta();
-        let resumedCount = 0;
-        for (const [dlId, saved] of Object.entries(allMeta.downloads)) {
-            if (saved.status === 'paused' && saved.autoPausedForStream) {
-                console.log(`[Downloads] Auto-resuming download "${saved.title}" (${dlId}) now that playback stopped`);
-                saved.autoPausedForStream = false;
-                saveDownloadsMeta(allMeta);
-                startDownload(saved.hash, saved.title, saved.imdbId, saved.season, saved.episode, saved.fileIdx);
-                resumedCount++;
+        if (activeEngines.has(stoppedHash)) {
+            const eng = activeEngines.get(stoppedHash);
+            if (!isEngineSharedWithDownloads(stoppedHash, eng)) {
+                try {
+                    if (!eng.isMock && typeof eng.destroy === 'function') {
+                        eng.destroy();
+                        console.log(`[Engine] Stopped streaming engine for ${stoppedHash} (playback exited after grace period)`);
+                    }
+                } catch (e) {}
+                activeEngines.delete(stoppedHash);
             }
         }
-        if (resumedCount > 0) {
-            broadcastDownloadEvents();
+
+        if (activeStreamingHash === stoppedHash) {
+            activeStreamingHash = null;
         }
-    }, 3000);
+
+        if (autoResumeTimeout) clearTimeout(autoResumeTimeout);
+        autoResumeTimeout = setTimeout(() => {
+            autoResumeTimeout = null;
+            if (activeStreamingHash) return;
+
+            const allMeta = loadDownloadsMeta();
+            let resumedCount = 0;
+            for (const [dlId, saved] of Object.entries(allMeta.downloads)) {
+                if (saved.status === 'paused' && saved.autoPausedForStream) {
+                    console.log(`[Downloads] Auto-resuming download "${saved.title}" (${dlId}) now that playback stopped`);
+                    saved.autoPausedForStream = false;
+                    saveDownloadsMeta(allMeta);
+                    startDownload(saved.hash, saved.title, saved.imdbId, saved.season, saved.episode, saved.fileIdx);
+                    resumedCount++;
+                }
+            }
+            if (resumedCount > 0) {
+                broadcastDownloadEvents();
+            }
+        }, 2000);
+    }, 6000);
+
+    stopGraceTimeouts.set(normalized, timer);
 }
 
 // --- DOWNLOADS META PERSISTENCE ---
@@ -470,12 +493,23 @@ function startDownload(hash, title, imdbId, season, episode, fileIdx) {
 
     console.log(`[Downloads] Starting download: ${title} (${hash}) [ID: ${downloadId}]`);
 
+    // Asynchronously warm .torrent metadata cache from HTTP if not yet on disk
+    prefetchTorrentCacheFile(hash, downloadDir).catch(() => {});
+
     const engine = torrentStream(`magnet:?xt=urn:btih:${hash}&tr=${TRACKERS.map(encodeURIComponent).join('&tr=')}`, {
         tmp: downloadDir,
         path: downloadDir,
         trackers: TRACKERS,
-        connections: 100
+        dht: getSharedDht(),
+        connections: 150,
+        uploads: 8
     });
+
+    if (typeof engine.listen === 'function') {
+        engine.listen(0, () => {
+            console.log(`[Downloads] Swarm listening on port ${engine.port} for ${hash}`);
+        });
+    }
 
     // If it was streaming, immediately register the new download engine in activeEngines
     // so any incoming playback requests (/proxy, /status) seamlessly route to it.
@@ -698,33 +732,126 @@ function createDownloadsWindow() {
 }
 
 const TRACKERS = [
-    'udp://opentor.net:6969',
-    'http://retracker.local/announce',
     'udp://tracker.opentrackr.org:1337/announce',
+    'udp://open.demonii.com:1337/announce',
+    'udp://exodus.desync.com:6969/announce',
     'udp://open.stealth.si:80/announce',
-    'http://open.tracker.cl:1337/announce',
     'udp://tracker.torrent.eu.org:451/announce',
-    'udp://zer0day.ch:1337/announce',
-    'udp://wepzone.net:6969/announce',
-    'udp://tracker.srv00.com:6969/announce',
-    'udp://tracker.filemail.com:6969/announce',
-    'udp://tracker.dler.org:6969/announce',
-    'udp://tracker.bittor.pw:1337/announce',
-    'udp://tracker-udp.gbitt.info:80/announce',
-    'udp://run.publictracker.xyz:6969/announce',
-    'udp://opentracker.io:6969/announce',
-    'udp://open.dstud.io:6969/announce',
+    'udp://tracker.openbittorrent.com:6969/announce',
+    'udp://tracker.moeking.me:6969/announce',
     'udp://explodie.org:6969/announce',
-    'https://tracker.iperson.xyz:443/announce',
-    'https://torrent.tracker.durukanbal.com:443/announce',
-    'https://cny.fan:443/announce',
-    'http://tracker2.dler.org:80/announce',
-    'http://tracker.wepzone.net:6969/announce',
+    'udp://tracker1.bt.moack.co.kr:80/announce',
+    'udp://tracker.theoks.net:6969/announce',
+    'udp://tracker.tiny-vps.com:6969/announce',
+    'udp://tracker.dler.org:6969/announce',
+    'udp://opentracker.io:6969/announce',
+    'udp://open.free-tracker.ga:6969/announce',
+    'udp://opentor.net:6969',
+    'udp://p4p.arenabg.com:1337/announce',
+    'udp://movies.zsw.ca:6969/announce',
+    'http://tracker.opentrackr.org:1337/announce',
+    'http://tracker.openbittorrent.com:80/announce',
+    'http://open.acgnxtracker.com:80/announce',
+    'http://tracker.dler.org:6969/announce',
+    'https://tracker.tamersunion.org:443/announce',
+    'https://tracker.gbitt.info:443/announce',
     'http://bt.t-ru.org/ann?magnet',
     'http://bt2.t-ru.org/ann?magnet',
     'http://bt3.t-ru.org/ann?magnet',
     'http://bt4.t-ru.org/ann?magnet'
 ];
+
+// --- PERSISTENT DHT & METADATA CACHE ACCELERATION ---
+let sharedDht = null;
+function getSharedDht() {
+    if (sharedDht) return sharedDht;
+    try {
+        const DHT = require('bittorrent-dht/client');
+        if (typeof DHT === 'function') {
+            sharedDht = new DHT();
+            sharedDht.listen(0, () => {
+                console.log('[DHT] Shared persistent DHT node listening and pre-warming routing table');
+            });
+            sharedDht.on('error', (err) => {
+                console.log('[DHT] Warning:', err.message);
+            });
+        }
+    } catch (e) {
+        console.log('[DHT] Could not initialize shared DHT:', e.message);
+    }
+    return sharedDht || true;
+}
+// Pre-warm DHT immediately on module load
+getSharedDht();
+
+// Pre-fetch .torrent metadata from public HTTP caches if not already cached locally
+async function prefetchTorrentCacheFile(hash, targetDir) {
+    if (!hash) return null;
+    const cleanHash = String(hash).trim().toLowerCase();
+    const upperHash = cleanHash.toUpperCase();
+    const cacheTorrentDir = path.join(targetDir, 'torrent-stream');
+    const cacheTorrentPath = path.join(cacheTorrentDir, `${cleanHash}.torrent`);
+
+    try {
+        if (fs.existsSync(cacheTorrentPath) && fs.statSync(cacheTorrentPath).size > 64) {
+            return cacheTorrentPath;
+        }
+    } catch (_) {}
+
+    const urls = [
+        `https://itorrents.org/torrent/${upperHash}.torrent`,
+        `https://torrage.info/torrent.php?h=${upperHash}`
+    ];
+
+    for (const url of urls) {
+        try {
+            const res = await fetch(url, {
+                headers: {
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+                },
+                redirect: 'follow',
+                signal: AbortSignal.timeout(2200)
+            });
+            if (!res.ok) continue;
+            const ab = await res.arrayBuffer();
+            const buf = Buffer.from(ab);
+            // Valid bencoded .torrent starts with 'd' (0x64)
+            if (buf.length > 64 && buf[0] === 0x64) {
+                fs.mkdirSync(cacheTorrentDir, { recursive: true });
+                fs.writeFileSync(cacheTorrentPath, buf);
+                console.log(`[Engine] Fast-resolved .torrent metadata via HTTP cache (${buf.length} bytes) for ${cleanHash}`);
+                return cacheTorrentPath;
+            }
+        } catch (_) {
+            // Ignore timeout/network errors and fall back to DHT/tracker magnet resolution
+        }
+    }
+    return null;
+}
+
+// Detect hardware H.264 encoder for fast 4K HEVC transcoding while preserving original resolution
+let preferredH264Encoder = null;
+function detectHardwareEncoder() {
+    if (preferredH264Encoder !== null) return preferredH264Encoder;
+    preferredH264Encoder = 'libx264'; // Default fallback while probing
+    try {
+        ffmpeg.getAvailableEncoders((err, encoders) => {
+            if (err || !encoders) return;
+            if (encoders['h264_nvenc']) {
+                preferredH264Encoder = 'h264_nvenc';
+            } else if (encoders['h264_qsv']) {
+                preferredH264Encoder = 'h264_qsv';
+            } else if (encoders['h264_amf']) {
+                preferredH264Encoder = 'h264_amf';
+            }
+            console.log(`[FFmpeg] Selected H.264 encoder: ${preferredH264Encoder}`);
+        });
+    } catch (e) {
+        console.log('[FFmpeg] Encoder detection skipped:', e.message);
+    }
+    return preferredH264Encoder;
+}
+detectHardwareEncoder();
 
 if (!fs.existsSync(DOWNLOAD_PATH)) fs.mkdirSync(DOWNLOAD_PATH, { recursive: true });
 
@@ -951,10 +1078,11 @@ function prioritizeFileBoundaryPieces(engine, file) {
         if (pieceLength && pieceLength > 0 && typeof engine.critical === 'function') {
             const startPiece = Math.floor(file.offset / pieceLength);
             const endPiece = Math.floor((file.offset + file.length - 1) / pieceLength);
-            const headWidth = Math.min(6, Math.max(1, endPiece - startPiece + 1));
-            // Only mark head pieces as critical so segment-0.ts starts as fast as possible
+            // Prioritize ~24 MB at the head of the file (minimum 2 pieces, max 8) so segment-0.ts starts immediately
+            const targetHeadPieces = Math.max(2, Math.min(8, Math.ceil((24 * 1024 * 1024) / pieceLength)));
+            const headWidth = Math.min(targetHeadPieces, Math.max(1, endPiece - startPiece + 1));
             engine.critical(startPiece, headWidth);
-            console.log(`[Engine] Prioritized head pieces: [${startPiece} (x${headWidth})]`);
+            console.log(`[Engine] Prioritized head pieces: [${startPiece} (x${headWidth}, pieceLength=${(pieceLength / 1024 / 1024).toFixed(2)}MB)]`);
         }
     } catch (e) {
         console.log('[Engine] Error prioritizing boundary pieces:', e.message);
@@ -1137,11 +1265,22 @@ function getEngine(hash, fileIdx = null, season = null, episode = null) {
     }
 
     console.log(`[Engine] Creating for hash: ${hash}, fileIdx: ${fileIdx}, S${season}E${episode}`);
+    // Asynchronously warm .torrent metadata cache from HTTP if not yet on disk
+    prefetchTorrentCacheFile(hash, DOWNLOAD_PATH).catch(() => {});
+
     const engine = torrentStream(`magnet:?xt=urn:btih:${hash}&tr=${TRACKERS.map(encodeURIComponent).join('&tr=')}`, {
         tmp: DOWNLOAD_PATH,
         trackers: TRACKERS,
-        connections: 100
+        dht: getSharedDht(),
+        connections: 150,
+        uploads: 8
     });
+
+    if (typeof engine.listen === 'function') {
+        engine.listen(0, () => {
+            console.log(`[Engine] Swarm listening on port ${engine.port} for ${hash}`);
+        });
+    }
 
     engine.status = 'loading';
     engine.metadataReady = false;
@@ -1689,6 +1828,7 @@ function getVideoContentType(fileName) {
 // This translates FFmpeg's Rage requests into Torrent byte reads
 serverApp.get('/proxy/:hash', (req, res) => {
     const { hash } = req.params;
+    cancelStopGraceTimeout(hash);
 
     // Check if fully downloaded first (for robustness)
     const allMeta = loadDownloadsMeta();
@@ -1718,6 +1858,7 @@ serverApp.get('/proxy/:hash', (req, res) => {
 
     if (!range) {
         // Fallback for non-ranged requests (metadata probing)
+        prioritizeFileBoundaryPieces(engine, file);
         const stream = file.createReadStream();
         res.writeHead(200, {
             'Content-Length': file.length,
@@ -1733,6 +1874,18 @@ serverApp.get('/proxy/:hash', (req, res) => {
     const start = parseInt(positions[0], 10);
     const end = positions[1] ? parseInt(positions[1], 10) : file.length - 1;
     const chunksize = (end - start) + 1;
+
+    // Sliding Readahead Window: dynamically mark pieces covering [start, start + 24MB] as critical
+    try {
+        const pieceLength = (engine.torrent && engine.torrent.pieceLength) || engine.pieceLength;
+        if (pieceLength && pieceLength > 0 && typeof engine.critical === 'function') {
+            const currentPiece = Math.floor((file.offset + start) / pieceLength);
+            const fileEndPiece = Math.floor((file.offset + file.length - 1) / pieceLength);
+            const readaheadPieces = Math.max(2, Math.min(8, Math.ceil((24 * 1024 * 1024) / pieceLength)));
+            const width = Math.min(readaheadPieces, Math.max(1, fileEndPiece - currentPiece + 1));
+            engine.critical(currentPiece, width);
+        }
+    } catch (_) {}
 
     console.log(`[Proxy] ${hash}: Serving bytes ${start}-${end} (${chunksize})`);
 
@@ -2020,6 +2173,7 @@ serverApp.post('/stop/:hash', (req, res) => {
 
 serverApp.get('/status/:hash', (req, res) => {
     const hash = req.params.hash;
+    cancelStopGraceTimeout(hash);
     const engine = activeEngines.get(hash);
     if (!engine) return res.json({ status: 'not_started' });
     res.json({
@@ -2063,6 +2217,7 @@ serverApp.delete('/cache/clear', (req, res) => {
 // HLS Manifest (Virtual VOD)
 serverApp.get('/hls/:hash/index.m3u8', async (req, res) => {
     const hash = req.params.hash;
+    cancelStopGraceTimeout(hash);
     const engine = activeEngines.get(hash) || getEngine(hash);
 
     if (!engine.metadataReady) return res.status(503).send('Wait for metadata');
@@ -2091,6 +2246,7 @@ serverApp.get('/hls/:hash/index.m3u8', async (req, res) => {
 // HLS Segment Transcoder (Via Proxy)
 serverApp.get('/hls/:hash/segment-:index.ts', (req, res) => {
     const { hash, index } = req.params;
+    cancelStopGraceTimeout(hash);
     const engine = activeEngines.get(hash);
     if (!engine || !engine.videoFile) return res.status(404).end();
 
@@ -2099,7 +2255,8 @@ serverApp.get('/hls/:hash/segment-:index.ts', (req, res) => {
 
     // Smart Transcode Logic
     const isH264 = engine.videoCodec === 'h264';
-    const transcodeMode = isH264 ? 'Direct Remux' : 'Transcoding (Compatibility)';
+    const hwEncoder = detectHardwareEncoder();
+    const transcodeMode = isH264 ? 'Direct Remux' : `Transcoding (${hwEncoder})`;
 
     console.log(`[HLS] Parsing seg ${segIndex} (${startTime}s) | Codec: ${engine.videoCodec || 'Unknown'} | Mode: ${transcodeMode}`);
 
@@ -2126,11 +2283,18 @@ serverApp.get('/hls/:hash/segment-:index.ts', (req, res) => {
     if (isH264) {
         // H.264 = Direct Copy (Fastest)
         outputOptions.push('-c:v copy');
+    } else if (hwEncoder === 'h264_nvenc') {
+        outputOptions.push('-pix_fmt yuv420p', '-c:v h264_nvenc', '-preset p1', '-cq 23', '-g 48');
+    } else if (hwEncoder === 'h264_qsv') {
+        outputOptions.push('-pix_fmt nv12', '-c:v h264_qsv', '-preset veryfast', '-global_quality 23', '-g 48');
+    } else if (hwEncoder === 'h264_amf') {
+        outputOptions.push('-pix_fmt yuv420p', '-c:v h264_amf', '-quality speed', '-g 48');
     } else {
         // HEVC / 4K / Other = Preserve original resolution (4K stays 4K) with ultrafast 8-bit H.264
         outputOptions.push('-pix_fmt yuv420p');
         outputOptions.push('-c:v libx264');
         outputOptions.push('-preset ultrafast');
+        outputOptions.push('-threads 0');
         outputOptions.push('-crf 23');
         outputOptions.push('-g 48');
     }
