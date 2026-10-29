@@ -76,6 +76,109 @@ function broadcastDownloadEvents() {
 
 let tray = null;
 const activeEngines = new Map();
+let activeStreamingHash = null;
+let autoResumeTimeout = null;
+
+function isEngineSharedWithDownloads(hash, engine) {
+    for (const activeDl of activeDownloads.values()) {
+        if (activeDl.engine === engine || activeDl.meta?.hash === hash) {
+            return true;
+        }
+    }
+    return false;
+}
+
+function pauseCompetingStreamsAndDownloads(targetHash, targetDownloadId = null) {
+    activeStreamingHash = targetHash;
+    if (autoResumeTimeout) {
+        clearTimeout(autoResumeTimeout);
+        autoResumeTimeout = null;
+    }
+
+    // 1. Stop any other active streaming engines (previous movies/series left mid-watch)
+    for (const [otherHash, otherEngine] of activeEngines.entries()) {
+        if (otherHash === targetHash) continue;
+
+        if (isEngineSharedWithDownloads(otherHash, otherEngine)) {
+            activeEngines.delete(otherHash);
+            continue;
+        }
+
+        try {
+            if (!otherEngine.isMock && typeof otherEngine.destroy === 'function') {
+                otherEngine.destroy();
+                console.log(`[Engine] Paused previous streaming engine for ${otherHash} to prioritize ${targetHash}`);
+            }
+        } catch (e) {
+            console.log(`[Engine] Error stopping previous stream ${otherHash}:`, e.message);
+        }
+        activeEngines.delete(otherHash);
+    }
+
+    // 2. Auto-pause any active background downloads that are not the current playback target
+    let pausedAnyDownload = false;
+    for (const [dlId, activeDl] of activeDownloads.entries()) {
+        if (dlId === targetDownloadId || activeDl.meta?.hash === targetHash) continue;
+        if (activeDl.meta && (activeDl.meta.status === 'downloading' || activeDl.meta.status === 'loading')) {
+            console.log(`[Downloads] Auto-pausing background download "${activeDl.meta.title}" (${dlId}) to maximize bandwidth for active playback (${targetHash})`);
+            if (activeDl.interval) clearInterval(activeDl.interval);
+            if (activeDl.stalledTimeout) clearTimeout(activeDl.stalledTimeout);
+            if (activeDl.engine) {
+                try { activeDl.engine.destroy(); } catch (e) {}
+            }
+            activeDl.meta.status = 'paused';
+            activeDl.meta.autoPausedForStream = true;
+            persistDownloadMeta(dlId, activeDl.meta);
+            activeDownloads.delete(dlId);
+            pausedAnyDownload = true;
+        }
+    }
+
+    if (pausedAnyDownload) {
+        broadcastDownloadEvents();
+    }
+}
+
+function stopStreamAndResumeAutoPaused(stoppedHash) {
+    if (stoppedHash && activeEngines.has(stoppedHash)) {
+        const eng = activeEngines.get(stoppedHash);
+        if (!isEngineSharedWithDownloads(stoppedHash, eng)) {
+            try {
+                if (!eng.isMock && typeof eng.destroy === 'function') {
+                    eng.destroy();
+                    console.log(`[Engine] Stopped streaming engine for ${stoppedHash} (playback exited)`);
+                }
+            } catch (e) {}
+            activeEngines.delete(stoppedHash);
+        }
+    }
+
+    if (!stoppedHash || activeStreamingHash === stoppedHash) {
+        activeStreamingHash = null;
+    }
+
+    // Wait 3s before auto-resuming background downloads in case user is switching to another episode/movie
+    if (autoResumeTimeout) clearTimeout(autoResumeTimeout);
+    autoResumeTimeout = setTimeout(() => {
+        autoResumeTimeout = null;
+        if (activeStreamingHash) return;
+
+        const allMeta = loadDownloadsMeta();
+        let resumedCount = 0;
+        for (const [dlId, saved] of Object.entries(allMeta.downloads)) {
+            if (saved.status === 'paused' && saved.autoPausedForStream) {
+                console.log(`[Downloads] Auto-resuming download "${saved.title}" (${dlId}) now that playback stopped`);
+                saved.autoPausedForStream = false;
+                saveDownloadsMeta(allMeta);
+                startDownload(saved.hash, saved.title, saved.imdbId, saved.season, saved.episode, saved.fileIdx);
+                resumedCount++;
+            }
+        }
+        if (resumedCount > 0) {
+            broadcastDownloadEvents();
+        }
+    }, 3000);
+}
 
 // --- DOWNLOADS META PERSISTENCE ---
 
@@ -542,6 +645,7 @@ function persistDownloadMeta(downloadId, meta) {
         downloadDir: meta.downloadDir,
         subtitles: meta.subtitles,
         status: meta.status,
+        autoPausedForStream: Boolean(meta.autoPausedForStream),
         startedAt: meta.startedAt,
         completedAt: meta.completedAt
     };
@@ -554,8 +658,9 @@ function restoreDownloads() {
     console.log(`[Downloads] Restoring active downloads from ${downloadIds.length} saved entries...`);
     downloadIds.forEach(id => {
         const saved = allMeta.downloads[id];
-        // Only spin up active P2P engines for in-progress downloads; completed items are served directly from disk
-        if (saved.status === 'downloading' || saved.status === 'loading') {
+        // Only spin up active P2P engines for in-progress downloads (or ones temporarily auto-paused for streaming)
+        if (saved.status === 'downloading' || saved.status === 'loading' || (saved.status === 'paused' && saved.autoPausedForStream)) {
+            saved.autoPausedForStream = false;
             startDownload(saved.hash, saved.title, saved.imdbId, saved.season, saved.episode, saved.fileIdx);
         }
     });
@@ -696,22 +801,10 @@ function removeTorrentFromCache(hash) {
 // --- SEEDING RESTORATION (on startup) ---
 
 function restoreCachedTorrents() {
+    // Do not spin up previous streaming torrents on startup so new streams get 100% bandwidth.
+    // Cached files on disk are still preserved for 72h if the user resumes watching them.
     const meta = loadCacheMeta();
-    // Only restore at most 2 recently accessed torrents on startup so we don't choke CPU/network
-    const now = Date.now();
-    const recentEntries = Object.entries(meta.torrents)
-        .filter(([_, info]) => now - (info.lastAccessed || 0) < 12 * 3600 * 1000)
-        .sort((a, b) => (b[1].lastAccessed || 0) - (a[1].lastAccessed || 0))
-        .slice(0, 2);
-
-    console.log(`[Seeding] Restoring ${recentEntries.length} recent cached torrents for seeding (out of ${Object.keys(meta.torrents).length})...`);
-
-    recentEntries.forEach(([hash, info]) => {
-        if (!activeEngines.has(hash)) {
-            getEngine(hash, info.fileIdx, info.season, info.episode);
-            console.log(`[Seeding] Restored seeder for ${hash}`);
-        }
-    });
+    console.log(`[Cache] ${Object.keys(meta.torrents).length} cached streaming torrents available on disk (idle until played).`);
 }
 
 // --- CACHE CLEANUP (72h auto-delete) ---
@@ -912,6 +1005,9 @@ function applyProbeMetadata(engine, metadata) {
 }
 
 function getEngine(hash, fileIdx = null, season = null, episode = null) {
+    const downloadId = getDownloadId(hash, season, episode, fileIdx);
+    pauseCompetingStreamsAndDownloads(hash, downloadId);
+
     if (activeEngines.has(hash)) {
         const existingEngine = activeEngines.get(hash);
         // Update file selection if season/episode provided and different
@@ -936,7 +1032,6 @@ function getEngine(hash, fileIdx = null, season = null, episode = null) {
 
     // Check downloads database first
     const allMeta = loadDownloadsMeta();
-    const downloadId = getDownloadId(hash, season, episode, fileIdx);
     const entry = allMeta.downloads[downloadId];
     if (entry) {
         if (entry.status === 'completed') {
@@ -1924,6 +2019,20 @@ serverApp.get('/start/:hash', (req, res) => {
     res.json({ status: 'started', hash, fileIdx, season, episode });
 });
 
+serverApp.get('/stop/:hash', (req, res) => {
+    const { hash } = req.params;
+    console.log(`[HTTP Stop] Stopping stream for hash: ${hash}`);
+    stopStreamAndResumeAutoPaused(hash);
+    res.json({ status: 'stopped', hash });
+});
+
+serverApp.post('/stop/:hash', (req, res) => {
+    const { hash } = req.params;
+    console.log(`[HTTP Stop] Stopping stream for hash: ${hash}`);
+    stopStreamAndResumeAutoPaused(hash);
+    res.json({ status: 'stopped', hash });
+});
+
 serverApp.get('/status/:hash', (req, res) => {
     const hash = req.params.hash;
     const engine = activeEngines.get(hash);
@@ -2190,6 +2299,7 @@ serverApp.get('/download/pause/:id', (req, res) => {
         try { active.engine.destroy(); } catch (e) { }
     }
     active.meta.status = 'paused';
+    active.meta.autoPausedForStream = false;
     persistDownloadMeta(downloadId, active.meta);
     activeDownloads.delete(downloadId);
     broadcastDownloadEvents();
