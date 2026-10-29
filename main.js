@@ -951,15 +951,10 @@ function prioritizeFileBoundaryPieces(engine, file) {
         if (pieceLength && pieceLength > 0 && typeof engine.critical === 'function') {
             const startPiece = Math.floor(file.offset / pieceLength);
             const endPiece = Math.floor((file.offset + file.length - 1) / pieceLength);
-            const headWidth = Math.min(4, Math.max(1, endPiece - startPiece + 1));
-            const tailPiece = Math.max(startPiece, endPiece - 1);
-            const tailWidth = Math.max(1, endPiece - tailPiece + 1);
-            // NOTE: torrent-stream's engine.critical(piece, width) takes (startPiece, countOfPieces), NOT (startPiece, endPiece)!
+            const headWidth = Math.min(6, Math.max(1, endPiece - startPiece + 1));
+            // Only mark head pieces as critical so segment-0.ts starts as fast as possible
             engine.critical(startPiece, headWidth);
-            if (tailPiece > startPiece + headWidth) {
-                engine.critical(tailPiece, tailWidth);
-            }
-            console.log(`[Engine] Prioritized boundary pieces: head [${startPiece} (x${headWidth})], tail [${tailPiece} (x${tailWidth})]`);
+            console.log(`[Engine] Prioritized head pieces: [${startPiece} (x${headWidth})]`);
         }
     } catch (e) {
         console.log('[Engine] Error prioritizing boundary pieces:', e.message);
@@ -1049,7 +1044,7 @@ function getEngine(hash, fileIdx = null, season = null, episode = null) {
                 
                 // Probe local file in background for duration and codecs
                 if (!mockEngine.duration || !mockEngine.videoCodec) {
-                    ffmpeg.ffprobe(`http://127.0.0.1:${PORT}/proxy/${hash}`, (err, metadata) => {
+                    ffmpeg.ffprobe(`http://127.0.0.1:${PORT}/proxy/${hash}`, ['-seekable', '0', '-probesize', '5000000', '-analyzeduration', '5000000'], (err, metadata) => {
                         if (!err && metadata) {
                             applyProbeMetadata(mockEngine, metadata);
                             console.log(`[Mock Engine] Probed duration: ${mockEngine.duration}s | video: ${mockEngine.videoCodec} | audio: ${mockEngine.audioCodec}`);
@@ -1207,7 +1202,7 @@ function getEngine(hash, fileIdx = null, season = null, episode = null) {
             if (engine.isProbing) return;
             engine.isProbing = true;
             // Probe using the local proxy to test it simultaneously
-            ffmpeg.ffprobe(`http://127.0.0.1:${PORT}/proxy/${hash}`, (err, metadata) => {
+            ffmpeg.ffprobe(`http://127.0.0.1:${PORT}/proxy/${hash}`, ['-seekable', '0', '-probesize', '5000000', '-analyzeduration', '5000000'], (err, metadata) => {
                 engine.isProbing = false;
                 if (!err && metadata && metadata.format && metadata.format.duration) {
                     applyProbeMetadata(engine, metadata);
@@ -2099,21 +2094,25 @@ serverApp.get('/hls/:hash/segment-:index.ts', (req, res) => {
     const engine = activeEngines.get(hash);
     if (!engine || !engine.videoFile) return res.status(404).end();
 
-    const startTime = parseInt(index) * SEGMENT_DURATION;
+    const segIndex = parseInt(index, 10);
+    const startTime = segIndex * SEGMENT_DURATION;
 
     // Smart Transcode Logic
     const isH264 = engine.videoCodec === 'h264';
     const transcodeMode = isH264 ? 'Direct Remux' : 'Transcoding (Compatibility)';
 
-    console.log(`[HLS] Parsing seg ${index} (${startTime}s) | Codec: ${engine.videoCodec || 'Unknown'} | Mode: ${transcodeMode}`);
+    console.log(`[HLS] Parsing seg ${segIndex} (${startTime}s) | Codec: ${engine.videoCodec || 'Unknown'} | Mode: ${transcodeMode}`);
 
     res.setHeader('Content-Type', 'video/mp2t');
 
-    // Build FFmpeg Command w/ Smart Options
+    // For segment 0 (startTime === 0), pass -seekable 0 so FFmpeg streams sequentially from byte 0
+    // without jumping to the end of 20GB+ MKV files to parse Cues/Indexes before outputting frames.
+    const inputOpts = startTime > 0
+        ? [`-ss ${startTime}`]
+        : ['-seekable 0'];
+
     const ffmpegCommand = ffmpeg(`http://127.0.0.1:${PORT}/proxy/${hash}`)
-        .inputOptions([
-            `-ss ${startTime}`
-        ]);
+        .inputOptions(inputOpts);
 
     const outputOptions = [
         `-t ${SEGMENT_DURATION}`,
@@ -2128,23 +2127,39 @@ serverApp.get('/hls/:hash/segment-:index.ts', (req, res) => {
         // H.264 = Direct Copy (Fastest)
         outputOptions.push('-c:v copy');
     } else {
-        // HEVC/Other = Transcode (Compatible)
+        // HEVC / 4K / Other = Real-time Compatible Transcode
+        // Cap resolution at 1080p during software transcode so 4K (2160p) 10-bit HEVC files
+        // don't bottleneck the CPU at <0.3x speed and cause HLS segment timeouts.
+        outputOptions.push('-vf scale=min(1920\,iw):-2');
+        outputOptions.push('-pix_fmt yuv420p');
         outputOptions.push('-c:v libx264');
-        outputOptions.push('-preset superfast'); // Fast encoding
-        outputOptions.push('-crf 23');           // Reasonalble quality
-        outputOptions.push('-g 48');             // Keyframe interval for HLS
+        outputOptions.push('-preset ultrafast');
+        outputOptions.push('-crf 23');
+        outputOptions.push('-g 48');
     }
+
+    let commandFinished = false;
+    req.on('close', () => {
+        if (!commandFinished) {
+            try {
+                ffmpegCommand.kill('SIGKILL');
+            } catch (e) {}
+        }
+    });
 
     ffmpegCommand
         .outputOptions(outputOptions)
         .on('start', (cmd) => console.log(`[FFmpeg] Started: ${cmd}`))
+        .on('end', () => {
+            commandFinished = true;
+        })
         .on('stderr', (line) => {
-            // Only log errors or warnings to avoid clutter
             if (line.includes('Error') || line.includes('warn') || line.includes('fail')) {
                 console.log(`[FFmpeg-Log] ${line}`);
             }
         })
         .on('error', (err) => {
+            commandFinished = true;
             if (!err.message.includes('SIGKILL') && !err.message.includes('404')) {
                 console.error(`[HLS-FFmpeg] Critical Error:`, err.message);
             }
