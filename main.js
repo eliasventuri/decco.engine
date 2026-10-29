@@ -951,25 +951,15 @@ function prioritizeFileBoundaryPieces(engine, file) {
         if (pieceLength && pieceLength > 0 && typeof engine.critical === 'function') {
             const startPiece = Math.floor(file.offset / pieceLength);
             const endPiece = Math.floor((file.offset + file.length - 1) / pieceLength);
-            const headEnd = Math.min(endPiece, startPiece + 4);
-            const tailStart = Math.max(startPiece, endPiece - 1);
-            engine.critical(startPiece, headEnd);
-            if (tailStart > headEnd) {
-                engine.critical(tailStart, endPiece);
+            const headWidth = Math.min(4, Math.max(1, endPiece - startPiece + 1));
+            const tailPiece = Math.max(startPiece, endPiece - 1);
+            const tailWidth = Math.max(1, endPiece - tailPiece + 1);
+            // NOTE: torrent-stream's engine.critical(piece, width) takes (startPiece, countOfPieces), NOT (startPiece, endPiece)!
+            engine.critical(startPiece, headWidth);
+            if (tailPiece > startPiece + headWidth) {
+                engine.critical(tailPiece, tailWidth);
             }
-            console.log(`[Engine] Prioritized boundary pieces: head [${startPiece}..${headEnd}], tail [${tailStart}..${endPiece}]`);
-        }
-        // Also nudge torrent-stream's internal piece selection for the container footer (MP4 moov / MKV cues)
-        if (file.length > 65536 && typeof file.createReadStream === 'function') {
-            const tailStream = file.createReadStream({
-                start: Math.max(0, file.length - 65536),
-                end: file.length - 1
-            });
-            tailStream.on('data', () => tailStream.destroy());
-            tailStream.on('error', () => {});
-            setTimeout(() => {
-                try { tailStream.destroy(); } catch (e) {}
-            }, 4000);
+            console.log(`[Engine] Prioritized boundary pieces: head [${startPiece} (x${headWidth})], tail [${tailPiece} (x${tailWidth})]`);
         }
     } catch (e) {
         console.log('[Engine] Error prioritizing boundary pieces:', e.message);
