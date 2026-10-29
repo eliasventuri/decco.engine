@@ -2127,10 +2127,7 @@ serverApp.get('/hls/:hash/segment-:index.ts', (req, res) => {
         // H.264 = Direct Copy (Fastest)
         outputOptions.push('-c:v copy');
     } else {
-        // HEVC / 4K / Other = Real-time Compatible Transcode
-        // Cap resolution at 1080p during software transcode so 4K (2160p) 10-bit HEVC files
-        // don't bottleneck the CPU at <0.3x speed and cause HLS segment timeouts.
-        outputOptions.push('-vf scale=min(1920\,iw):-2');
+        // HEVC / 4K / Other = Preserve original resolution (4K stays 4K) with ultrafast 8-bit H.264
         outputOptions.push('-pix_fmt yuv420p');
         outputOptions.push('-c:v libx264');
         outputOptions.push('-preset ultrafast');
