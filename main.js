@@ -115,10 +115,15 @@ function findExactVideoFile(dir, fileName) {
     return foundPath || findVideoFile(dir);
 }
 
+let cachedDownloadsMeta = null;
+let saveDownloadsMetaTimeout = null;
+
 function loadDownloadsMeta() {
+    if (cachedDownloadsMeta) return cachedDownloadsMeta;
     try {
         if (fs.existsSync(DOWNLOADS_META_PATH)) {
-            return JSON.parse(fs.readFileSync(DOWNLOADS_META_PATH, 'utf-8'));
+            cachedDownloadsMeta = JSON.parse(fs.readFileSync(DOWNLOADS_META_PATH, 'utf-8'));
+            return cachedDownloadsMeta;
         }
     } catch (e) {
         console.log('[Downloads] Error loading meta:', e.message);
@@ -130,23 +135,28 @@ function loadDownloadsMeta() {
             console.log('[Downloads] Failed to backup corrupted meta:', err.message);
         }
     }
-    return { downloads: {} };
+    cachedDownloadsMeta = { downloads: {} };
+    return cachedDownloadsMeta;
 }
 
 function saveDownloadsMeta(meta) {
-    try {
-        const tempPath = `${DOWNLOADS_META_PATH}.tmp.${Date.now()}`;
-        fs.writeFileSync(tempPath, JSON.stringify(meta, null, 2));
-        fs.renameSync(tempPath, DOWNLOADS_META_PATH);
-    } catch (e) {
-        console.log('[Downloads] Error saving meta atomically:', e.message);
-        // Fallback standard write if rename fails
+    cachedDownloadsMeta = meta;
+    if (saveDownloadsMetaTimeout) return;
+    saveDownloadsMetaTimeout = setTimeout(async () => {
+        saveDownloadsMetaTimeout = null;
         try {
-            fs.writeFileSync(DOWNLOADS_META_PATH, JSON.stringify(meta, null, 2));
-        } catch (err) {
-            console.log('[Downloads] Fallback save failed:', err.message);
+            const tempPath = `${DOWNLOADS_META_PATH}.tmp.${Date.now()}`;
+            await fs.promises.writeFile(tempPath, JSON.stringify(cachedDownloadsMeta, null, 2));
+            await fs.promises.rename(tempPath, DOWNLOADS_META_PATH);
+        } catch (e) {
+            console.log('[Downloads] Error saving meta atomically:', e.message);
+            try {
+                await fs.promises.writeFile(DOWNLOADS_META_PATH, JSON.stringify(cachedDownloadsMeta, null, 2));
+            } catch (err) {
+                console.log('[Downloads] Fallback save failed:', err.message);
+            }
         }
-    }
+    }, 500);
 }
 
 // --- SRT TO WEBVTT CONVERTER ---
@@ -315,14 +325,27 @@ function startDownload(hash, title, imdbId, season, episode, fileIdx) {
             console.error(`[Downloads] Error destroying streaming engine for transition:`, e.message);
         }
 
-        // Copy already cached files to the permanent download directory so progress is preserved
+        // Move already cached files to the permanent download directory so progress is preserved without blocking the thread
         if (srcPath && fs.existsSync(srcPath)) {
             try {
-                console.log(`[Downloads] Copying cached files from "${srcPath}" to "${downloadDir}"...`);
-                fs.cpSync(srcPath, downloadDir, { recursive: true, force: true, errorOnExist: false });
-                console.log(`[Downloads] Copied cached files successfully.`);
+                console.log(`[Downloads] Moving cached files from "${srcPath}" to "${downloadDir}"...`);
+                const entries = fs.readdirSync(srcPath);
+                for (const entryName of entries) {
+                    const srcItem = path.join(srcPath, entryName);
+                    const destItem = path.join(downloadDir, entryName);
+                    try {
+                        if (fs.existsSync(destItem)) {
+                            fs.rmSync(destItem, { recursive: true, force: true });
+                        }
+                        fs.renameSync(srcItem, destItem);
+                    } catch (renameErr) {
+                        // Cross-device fallback
+                        fs.cpSync(srcItem, destItem, { recursive: true, force: true, errorOnExist: false });
+                    }
+                }
+                console.log(`[Downloads] Moved cached files successfully.`);
 
-                // Clean up the temporary streaming files now that they are copied to completed-downloads
+                // Clean up the temporary streaming folder now that contents are moved to completed-downloads
                 try {
                     fs.rmSync(srcPath, { recursive: true, force: true });
                     console.log(`[Downloads] Cleaned up temporary stream files from "${srcPath}"`);
@@ -337,7 +360,7 @@ function startDownload(hash, title, imdbId, season, episode, fileIdx) {
                     console.error(`[Downloads] Failed to remove torrent from cache metadata:`, metaErr.message);
                 }
             } catch (e) {
-                console.error(`[Downloads] Failed to copy cached files:`, e.message);
+                console.error(`[Downloads] Failed to move cached files:`, e.message);
             }
         }
     }
@@ -528,10 +551,11 @@ function persistDownloadMeta(downloadId, meta) {
 function restoreDownloads() {
     const allMeta = loadDownloadsMeta();
     const downloadIds = Object.keys(allMeta.downloads);
-    console.log(`[Downloads] Restoring ${downloadIds.length} downloads...`);
+    console.log(`[Downloads] Restoring active downloads from ${downloadIds.length} saved entries...`);
     downloadIds.forEach(id => {
         const saved = allMeta.downloads[id];
-        if (saved.status === 'downloading' || saved.status === 'loading' || saved.status === 'completed') {
+        // Only spin up active P2P engines for in-progress downloads; completed items are served directly from disk
+        if (saved.status === 'downloading' || saved.status === 'loading') {
             startDownload(saved.hash, saved.title, saved.imdbId, saved.season, saved.episode, saved.fileIdx);
         }
     });
@@ -601,23 +625,39 @@ if (!fs.existsSync(DOWNLOAD_PATH)) fs.mkdirSync(DOWNLOAD_PATH, { recursive: true
 
 // --- CACHE METADATA MANAGEMENT ---
 
+let cachedCacheMeta = null;
+let saveCacheTimeout = null;
+
 function loadCacheMeta() {
+    if (cachedCacheMeta) return cachedCacheMeta;
     try {
         if (fs.existsSync(CACHE_META_PATH)) {
-            return JSON.parse(fs.readFileSync(CACHE_META_PATH, 'utf-8'));
+            cachedCacheMeta = JSON.parse(fs.readFileSync(CACHE_META_PATH, 'utf-8'));
+            if (!cachedCacheMeta || typeof cachedCacheMeta.torrents !== 'object') {
+                cachedCacheMeta = { torrents: {} };
+            }
+            return cachedCacheMeta;
         }
     } catch (e) {
         console.log('[Cache] Error loading meta:', e.message);
     }
-    return { torrents: {} };
+    cachedCacheMeta = { torrents: {} };
+    return cachedCacheMeta;
 }
 
 function saveCacheMeta(meta) {
-    try {
-        fs.writeFileSync(CACHE_META_PATH, JSON.stringify(meta, null, 2));
-    } catch (e) {
-        console.log('[Cache] Error saving meta:', e.message);
-    }
+    cachedCacheMeta = meta;
+    if (saveCacheTimeout) clearTimeout(saveCacheTimeout);
+    saveCacheTimeout = setTimeout(async () => {
+        saveCacheTimeout = null;
+        try {
+            const tmpPath = `${CACHE_META_PATH}.tmp`;
+            await fs.promises.writeFile(tmpPath, JSON.stringify(cachedCacheMeta, null, 2), 'utf-8');
+            await fs.promises.rename(tmpPath, CACHE_META_PATH);
+        } catch (e) {
+            console.log('[Cache] Error saving meta:', e.message);
+        }
+    }, 2000);
 }
 
 function addTorrentToCache(hash, info = {}) {
@@ -636,8 +676,13 @@ function addTorrentToCache(hash, info = {}) {
 function updateTorrentAccess(hash) {
     const meta = loadCacheMeta();
     if (meta.torrents[hash]) {
-        meta.torrents[hash].lastAccessed = Date.now();
-        saveCacheMeta(meta);
+        const now = Date.now();
+        // Only schedule disk write if more than 60s have passed since last update
+        const shouldPersist = !meta.torrents[hash].lastAccessed || (now - meta.torrents[hash].lastAccessed > 60000);
+        meta.torrents[hash].lastAccessed = now;
+        if (shouldPersist) {
+            saveCacheMeta(meta);
+        }
     }
 }
 
@@ -652,12 +697,16 @@ function removeTorrentFromCache(hash) {
 
 function restoreCachedTorrents() {
     const meta = loadCacheMeta();
-    const hashes = Object.keys(meta.torrents);
-    console.log(`[Seeding] Restoring ${hashes.length} cached torrents for seeding...`);
+    // Only restore at most 2 recently accessed torrents on startup so we don't choke CPU/network
+    const now = Date.now();
+    const recentEntries = Object.entries(meta.torrents)
+        .filter(([_, info]) => now - (info.lastAccessed || 0) < 12 * 3600 * 1000)
+        .sort((a, b) => (b[1].lastAccessed || 0) - (a[1].lastAccessed || 0))
+        .slice(0, 2);
 
-    hashes.forEach(hash => {
-        const info = meta.torrents[hash];
-        // Only restore if not already active
+    console.log(`[Seeding] Restoring ${recentEntries.length} recent cached torrents for seeding (out of ${Object.keys(meta.torrents).length})...`);
+
+    recentEntries.forEach(([hash, info]) => {
         if (!activeEngines.has(hash)) {
             getEngine(hash, info.fileIdx, info.season, info.episode);
             console.log(`[Seeding] Restored seeder for ${hash}`);
@@ -802,6 +851,66 @@ function findEpisodeFile(files, season, episode) {
 
 // --- ENGINE MANAGEMENT ---
 
+function prioritizeFileBoundaryPieces(engine, file) {
+    if (!engine || !file || engine.isMock) return;
+    try {
+        const pieceLength = (engine.torrent && engine.torrent.pieceLength) || engine.pieceLength;
+        if (pieceLength && pieceLength > 0 && typeof engine.critical === 'function') {
+            const startPiece = Math.floor(file.offset / pieceLength);
+            const endPiece = Math.floor((file.offset + file.length - 1) / pieceLength);
+            const headEnd = Math.min(endPiece, startPiece + 4);
+            const tailStart = Math.max(startPiece, endPiece - 1);
+            engine.critical(startPiece, headEnd);
+            if (tailStart > headEnd) {
+                engine.critical(tailStart, endPiece);
+            }
+            console.log(`[Engine] Prioritized boundary pieces: head [${startPiece}..${headEnd}], tail [${tailStart}..${endPiece}]`);
+        }
+        // Also nudge torrent-stream's internal piece selection for the container footer (MP4 moov / MKV cues)
+        if (file.length > 65536 && typeof file.createReadStream === 'function') {
+            const tailStream = file.createReadStream({
+                start: Math.max(0, file.length - 65536),
+                end: file.length - 1
+            });
+            tailStream.on('data', () => tailStream.destroy());
+            tailStream.on('error', () => {});
+            setTimeout(() => {
+                try { tailStream.destroy(); } catch (e) {}
+            }, 4000);
+        }
+    } catch (e) {
+        console.log('[Engine] Error prioritizing boundary pieces:', e.message);
+    }
+}
+
+function applyProbeMetadata(engine, metadata) {
+    if (!engine || !metadata) return;
+    if (metadata.format && metadata.format.duration) {
+        engine.duration = metadata.format.duration;
+    }
+    if (Array.isArray(metadata.streams)) {
+        const videoStream = metadata.streams.find(s => s.codec_type === 'video');
+        if (videoStream) {
+            engine.videoCodec = videoStream.codec_name;
+        }
+        const audioStream = metadata.streams.find(s => s.codec_type === 'audio');
+        if (audioStream) {
+            engine.audioCodec = audioStream.codec_name;
+        }
+        engine.embeddedSubtitles = metadata.streams
+            .filter(s => s.codec_type === 'subtitle')
+            .map((s, idx) => ({
+                index: s.index,
+                trackIndex: idx,
+                codec: s.codec_name,
+                language: s.tags?.language || 'unknown',
+                title: s.tags?.title || `Track ${idx + 1}`,
+                isForced: s.disposition?.forced === 1,
+                isDefault: s.disposition?.default === 1
+            }));
+    }
+}
+
 function getEngine(hash, fileIdx = null, season = null, episode = null) {
     if (activeEngines.has(hash)) {
         const existingEngine = activeEngines.get(hash);
@@ -817,6 +926,7 @@ function getEngine(hash, fileIdx = null, season = null, episode = null) {
                     existingEngine.files.forEach(f => f.deselect());
                     existingEngine.videoFile = correctFile;
                     correctFile.select();
+                    prioritizeFileBoundaryPieces(existingEngine, correctFile);
                     console.log(`[Engine] Corrected file selection to: ${correctFile.name} - Other files deselected`);
                 }
             }
@@ -852,21 +962,20 @@ function getEngine(hash, fileIdx = null, season = null, episode = null) {
                 
                 activeEngines.set(hash, mockEngine);
                 
-                // Probe local file in background for duration using the HTTP proxy URL (reliable and platform-agnostic)
-                if (!mockEngine.duration) {
+                // Probe local file in background for duration and codecs
+                if (!mockEngine.duration || !mockEngine.videoCodec) {
                     ffmpeg.ffprobe(`http://127.0.0.1:${PORT}/proxy/${hash}`, (err, metadata) => {
-                        if (!err && metadata.format && metadata.format.duration) {
-                            mockEngine.duration = metadata.format.duration;
-                            console.log(`[Mock Engine] Precise duration found in getEngine: ${mockEngine.duration}s`);
+                        if (!err && metadata) {
+                            applyProbeMetadata(mockEngine, metadata);
+                            console.log(`[Mock Engine] Probed duration: ${mockEngine.duration}s | video: ${mockEngine.videoCodec} | audio: ${mockEngine.audioCodec}`);
                             
                             // Save duration in persistent downloads metadata
                             try {
                                 const freshMeta = loadDownloadsMeta();
                                 const savedItem = freshMeta.downloads[downloadId];
-                                if (savedItem) {
+                                if (savedItem && mockEngine.duration) {
                                     savedItem.duration = mockEngine.duration;
                                     saveDownloadsMeta(freshMeta);
-                                    console.log(`[Mock Engine] Saved precise duration to downloads database for ${downloadId}`);
                                 }
                             } catch (saveErr) {
                                 console.error('[Mock Engine] Failed to save duration to database:', saveErr.message);
@@ -904,15 +1013,9 @@ function getEngine(hash, fileIdx = null, season = null, episode = null) {
                     
                     ffmpeg.ffprobe(`http://127.0.0.1:${PORT}/proxy/${hash}`, (err, metadata) => {
                         dlEngine.isProbing = false;
-                        if (!err && metadata.format && metadata.format.duration) {
-                            dlEngine.duration = metadata.format.duration;
-                            
-                            const videoStream = metadata.streams.find(s => s.codec_type === 'video');
-                            if (videoStream) {
-                                dlEngine.videoCodec = videoStream.codec_name;
-                                console.log(`[DL Engine] Codec Detected: ${dlEngine.videoCodec}`);
-                            }
-                            console.log(`[DL Engine] Precise duration found: ${dlEngine.duration}s`);
+                        if (!err && metadata && metadata.format && metadata.format.duration) {
+                            applyProbeMetadata(dlEngine, metadata);
+                            console.log(`[DL Engine] Codec Detected: ${dlEngine.videoCodec} / ${dlEngine.audioCodec} | Duration: ${dlEngine.duration}s`);
                             
                             // Save duration in persistent downloads metadata
                             try {
@@ -921,13 +1024,12 @@ function getEngine(hash, fileIdx = null, season = null, episode = null) {
                                 if (savedItem) {
                                     savedItem.duration = dlEngine.duration;
                                     saveDownloadsMeta(freshMeta);
-                                    console.log(`[DL Engine] Saved precise duration to downloads database for ${downloadId}`);
                                 }
                             } catch (saveErr) {
                                 console.error('[DL Engine] Failed to save duration to database:', saveErr.message);
                             }
                         } else if (dlEngine.status === 'ready') {
-                            setTimeout(probeDl, 5000);
+                            setTimeout(probeDl, 3000);
                         }
                     });
                 };
@@ -935,11 +1037,15 @@ function getEngine(hash, fileIdx = null, season = null, episode = null) {
                 if (dlEngine.videoFile) {
                     dlEngine.metadataReady = true;
                     dlEngine.status = 'ready';
+                    prioritizeFileBoundaryPieces(dlEngine, dlEngine.videoFile);
                     probeDl();
                 } else {
                     dlEngine.on('ready', () => {
                         dlEngine.metadataReady = true;
                         dlEngine.status = 'ready';
+                        if (dlEngine.videoFile) {
+                            prioritizeFileBoundaryPieces(dlEngine, dlEngine.videoFile);
+                        }
                         probeDl();
                     });
                 }
@@ -1008,29 +1114,22 @@ function getEngine(hash, fileIdx = null, season = null, episode = null) {
         engine.files.forEach(f => f.deselect());
         // Then select ONLY the file we need
         file.select();
+        prioritizeFileBoundaryPieces(engine, file);
         console.log(`[Engine] Selected ONLY: ${file.name} (${(file.length / 1024 / 1024).toFixed(1)} MB) - Other ${engine.files.length - 1} files deselected`);
 
-        // Background Duration Probe (via Proxy for speed)
+        // Background Duration & Codec Probe (via Proxy for speed)
         const probe = () => {
             if (engine.isProbing) return;
             engine.isProbing = true;
             // Probe using the local proxy to test it simultaneously
             ffmpeg.ffprobe(`http://127.0.0.1:${PORT}/proxy/${hash}`, (err, metadata) => {
                 engine.isProbing = false;
-                if (!err && metadata.format && metadata.format.duration) {
-                    engine.duration = metadata.format.duration;
-
-                    // Detect Video Codec
-                    const videoStream = metadata.streams.find(s => s.codec_type === 'video');
-                    if (videoStream) {
-                        engine.videoCodec = videoStream.codec_name; // e.g., 'h264', 'hevc'
-                        console.log(`[Engine] Codec Detected: ${engine.videoCodec}`);
-                    }
-
-                    console.log(`[Engine] Precise duration found: ${engine.duration}s`);
+                if (!err && metadata && metadata.format && metadata.format.duration) {
+                    applyProbeMetadata(engine, metadata);
+                    console.log(`[Engine] Codec Detected: ${engine.videoCodec} / ${engine.audioCodec} | Duration: ${engine.duration}s`);
                 } else if (engine.status === 'ready') {
-                    // Retry
-                    setTimeout(probe, 5000);
+                    // Retry faster (3s instead of 5s) since boundary pieces are prioritized
+                    setTimeout(probe, 3000);
                 }
             });
         };
@@ -1469,6 +1568,20 @@ serverApp.use((req, res, next) => {
     next();
 });
 
+// Fast, zero-disk-I/O health check endpoint for web discovery
+serverApp.get('/ping', (req, res) => {
+    res.json({ status: 'ok', port: PORT, version: '2.2' });
+});
+
+function getVideoContentType(fileName) {
+    if (!fileName) return 'video/mp4';
+    const ext = path.extname(fileName).toLowerCase();
+    if (ext === '.mkv') return 'video/x-matroska';
+    if (ext === '.webm') return 'video/webm';
+    if (ext === '.avi') return 'video/x-msvideo';
+    return 'video/mp4';
+}
+
 // INTERNAL HTTP PROXY (The "Smart" Layer)
 // This translates FFmpeg's Rage requests into Torrent byte reads
 serverApp.get('/proxy/:hash', (req, res) => {
@@ -1498,15 +1611,18 @@ serverApp.get('/proxy/:hash', (req, res) => {
 
     const file = engine.videoFile;
     const range = req.headers.range;
+    const contentType = getVideoContentType(file.name);
 
     if (!range) {
         // Fallback for non-ranged requests (metadata probing)
         const stream = file.createReadStream();
         res.writeHead(200, {
             'Content-Length': file.length,
-            'Content-Type': 'video/mp4'
+            'Accept-Ranges': 'bytes',
+            'Content-Type': contentType
         });
         stream.pipe(res);
+        req.on('close', () => stream.destroy());
         return;
     }
 
@@ -1521,7 +1637,7 @@ serverApp.get('/proxy/:hash', (req, res) => {
         "Content-Range": "bytes " + start + "-" + end + "/" + file.length,
         "Accept-Ranges": "bytes",
         "Content-Length": chunksize,
-        "Content-Type": "video/mp4"
+        "Content-Type": contentType
     });
 
     const stream = file.createReadStream({ start, end });
@@ -1680,6 +1796,10 @@ serverApp.get('/status/:hash', (req, res) => {
         fileIdx: engine.requestedFileIdx,
         totalFiles: engine.files ? engine.files.length : 0,
         duration: engine.duration || 0,
+        videoCodec: engine.videoCodec || null,
+        audioCodec: engine.audioCodec || null,
+        subtitles: engine.embeddedSubtitles || null,
+        progress: engine.isMock ? 1 : (engine.videoFile ? getFileProgress(engine, engine.videoFile) : 0),
         peers: engine.swarm ? engine.swarm.wires.length : 0,
         speed: engine.swarm ? (engine.swarm.downloadSpeed() / 1024).toFixed(2) : '0',
     });
@@ -1794,13 +1914,17 @@ serverApp.get('/hls/:hash/segment-:index.ts', (req, res) => {
 
 // --- SUBTITLE ENDPOINTS ---
 
-// List embedded subtitle tracks using FFprobe
+// List embedded subtitle tracks using FFprobe (or cached probe result)
 serverApp.get('/subtitles/:hash', async (req, res) => {
     const { hash } = req.params;
     const engine = activeEngines.get(hash);
 
     if (!engine || !engine.videoFile) {
         return res.status(404).json({ error: 'Engine or video file not found' });
+    }
+
+    if (Array.isArray(engine.embeddedSubtitles)) {
+        return res.json({ subtitles: engine.embeddedSubtitles });
     }
 
     const proxyUrl = `http://127.0.0.1:${PORT}/proxy/${hash}`;
@@ -1811,17 +1935,8 @@ serverApp.get('/subtitles/:hash', async (req, res) => {
             return res.status(500).json({ error: 'Failed to probe video' });
         }
 
-        const subtitleStreams = metadata.streams
-            .filter(s => s.codec_type === 'subtitle')
-            .map((s, idx) => ({
-                index: s.index,
-                trackIndex: idx,
-                codec: s.codec_name,
-                language: s.tags?.language || 'unknown',
-                title: s.tags?.title || `Track ${idx + 1}`,
-                isForced: s.disposition?.forced === 1,
-                isDefault: s.disposition?.default === 1
-            }));
+        applyProbeMetadata(engine, metadata);
+        const subtitleStreams = engine.embeddedSubtitles || [];
 
         console.log(`[Subtitles] Found ${subtitleStreams.length} subtitle tracks for ${hash}`);
         res.json({ subtitles: subtitleStreams });
