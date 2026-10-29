@@ -36,6 +36,10 @@ patchFile(tsIndex, [
     [
         '    var loop = function (i) {\n      if (i >= torrent.pieces.length) return onready()\n      engine.store.get(i, function (_, buf) {',
         '    var loop = function (i) {\n      if (i >= torrent.pieces.length) return onready()\n      var hasAnyExistingFile = torrent.files && torrent.files.some(function (file) {\n        try {\n          return fs.existsSync(path.join(opts.path, file.path))\n        } catch (_) {\n          return false\n        }\n      })\n      if (!hasAnyExistingFile) return onready()\n      engine.store.get(i, function (_, buf) {'
+    ],
+    [
+        '      if (!torrent.announce || !torrent.announce.length) {\n        opts.trackers = [].concat(opts.trackers || []).concat(link.announce || [])\n      }',
+        '      if (!torrent.announce || !torrent.announce.length) {\n        opts.trackers = [].concat(opts.trackers || []).concat(link.announce || [])\n        torrent.announce = opts.trackers\n      }'
     ]
 ]);
 
