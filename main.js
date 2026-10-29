@@ -1495,9 +1495,13 @@ function isAllowedLiveProxyProtocol(value) {
     return value === 'http:' || value === 'https:';
 }
 
-function buildEngineLiveProxyUrl(target, req) {
+function buildEngineLiveProxyUrl(target, req, opts) {
     const host = req && req.headers && req.headers.host ? req.headers.host : `127.0.0.1:${PORT}`;
-    return `http://${host}/live/proxy?url=${encodeURIComponent(target)}`;
+    const proxied = new URL(`http://${host}/live/proxy`);
+    proxied.searchParams.set('url', target);
+    if (opts && opts.referrer) proxied.searchParams.set('ref', opts.referrer);
+    if (opts && opts.userAgent) proxied.searchParams.set('ua', opts.userAgent);
+    return proxied.toString();
 }
 
 function absolutizeLiveProxyLine(line, baseUrl) {
@@ -1508,7 +1512,7 @@ function absolutizeLiveProxyLine(line, baseUrl) {
     }
 }
 
-function rewriteLiveManifest(manifest, baseUrl, req) {
+function rewriteLiveManifest(manifest, baseUrl, req, opts) {
     return manifest
         .split('\n')
         .map((rawLine) => {
@@ -1518,17 +1522,36 @@ function rewriteLiveManifest(manifest, baseUrl, req) {
             if (line.startsWith('#')) {
                 if (rawLine.includes('URI="')) {
                     return rawLine.replace(/URI="([^"]+)"/g, (_, uri) => {
+                        if (!uri || uri.startsWith('data:') || uri.startsWith('blob:')) return `URI="${uri}"`;
                         const absolute = absolutizeLiveProxyLine(uri, baseUrl);
-                        return `URI="${buildEngineLiveProxyUrl(absolute, req)}"`;
+                        return `URI="${buildEngineLiveProxyUrl(absolute, req, opts)}"`;
                     });
                 }
                 return rawLine;
             }
 
             const absolute = absolutizeLiveProxyLine(line, baseUrl);
-            return buildEngineLiveProxyUrl(absolute, req);
+            return buildEngineLiveProxyUrl(absolute, req, opts);
         })
         .join('\n');
+}
+
+function rewriteLiveDashManifest(manifest, baseUrl, req, opts) {
+    return manifest
+        .replace(/<(BaseURL)>([^<]+)<\/BaseURL>/g, (match, tag, value) => {
+            if (!value || value.startsWith('data:') || value.startsWith('blob:')) {
+                return match;
+            }
+            const absolute = absolutizeLiveProxyLine(value, baseUrl);
+            return `<${tag}>${buildEngineLiveProxyUrl(absolute, req, opts)}</${tag}>`;
+        })
+        .replace(/(media|initialization|sourceURL|href)="([^"]+)"/g, (match, attribute, value) => {
+            if (!value || value.startsWith('data:') || value.startsWith('blob:')) {
+                return match;
+            }
+            const absolute = absolutizeLiveProxyLine(value, baseUrl);
+            return `${attribute}="${buildEngineLiveProxyUrl(absolute, req, opts)}"`;
+        });
 }
 
 const serverApp = express();
@@ -1652,6 +1675,10 @@ serverApp.get('/proxy/:hash', (req, res) => {
 // through the local Decco Engine without routing traffic via production.
 serverApp.get('/live/proxy', async (req, res) => {
     const target = req.query.url;
+    const customReferrer = typeof req.query.ref === 'string' && req.query.ref ? req.query.ref : undefined;
+    const customUserAgent = typeof req.query.ua === 'string' && req.query.ua ? req.query.ua : undefined;
+    const shouldProbe = req.query.probe === '1';
+
     if (!target || typeof target !== 'string') {
         return res.status(400).json({ error: 'Missing url parameter' });
     }
@@ -1667,32 +1694,146 @@ serverApp.get('/live/proxy', async (req, res) => {
         return res.status(400).json({ error: 'Unsupported protocol' });
     }
 
+    const forwardOpts = {
+        referrer: customReferrer,
+        userAgent: customUserAgent,
+    };
+
     try {
-        const upstream = await fetch(parsed.toString(), {
-            headers: {
-                'User-Agent': req.headers['user-agent'] || 'Mozilla/5.0 Decco Engine Live Proxy',
-                'Accept': req.headers.accept || '*/*',
-            },
+        const requestHeaders = {
+            'User-Agent': customUserAgent || req.headers['user-agent'] || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+            'Accept': req.headers.accept || '*/*',
+        };
+
+        if (customReferrer) {
+            requestHeaders['Referer'] = customReferrer;
+            try {
+                requestHeaders['Origin'] = new URL(customReferrer).origin;
+            } catch {
+                // ignore invalid origin
+            }
+        }
+
+        if (req.headers.range && !shouldProbe) {
+            requestHeaders['Range'] = req.headers.range;
+        }
+
+        let upstream = await fetch(parsed.toString(), {
+            method: shouldProbe ? 'HEAD' : 'GET',
+            headers: requestHeaders,
             redirect: 'follow',
+            signal: AbortSignal.timeout(12000),
         });
+
+        if (!upstream.ok && (upstream.status === 403 || upstream.status === 401) && !customReferrer) {
+            const spoofedHeaders = {
+                ...requestHeaders,
+                'Referer': `${parsed.origin}/`,
+                'Origin': parsed.origin,
+            };
+            upstream = await fetch(parsed.toString(), {
+                method: shouldProbe ? 'HEAD' : 'GET',
+                headers: spoofedHeaders,
+                redirect: 'follow',
+                signal: AbortSignal.timeout(10000),
+            });
+            if (upstream.ok) {
+                forwardOpts.referrer = `${parsed.origin}/`;
+            }
+        }
+
+        if (shouldProbe && !upstream.ok && (upstream.status === 403 || upstream.status === 405)) {
+            upstream = await fetch(parsed.toString(), {
+                method: 'GET',
+                headers: {
+                    ...requestHeaders,
+                    ...(forwardOpts.referrer ? { 'Referer': forwardOpts.referrer } : {}),
+                    'Range': 'bytes=0-511',
+                },
+                redirect: 'follow',
+                signal: AbortSignal.timeout(10000),
+            });
+        }
 
         if (!upstream.ok) {
             return res.status(upstream.status).json({ error: `Upstream request failed with ${upstream.status}` });
         }
 
         const contentType = upstream.headers.get('content-type') || '';
-        const isManifest =
-            parsed.pathname.endsWith('.m3u8') ||
-            contentType.includes('application/vnd.apple.mpegurl') ||
-            contentType.includes('application/x-mpegurl');
+        const effectiveBaseUrl = upstream.url || parsed.toString();
+        let effectivePathname = parsed.pathname.toLowerCase();
+        try {
+            effectivePathname = new URL(effectiveBaseUrl).pathname.toLowerCase();
+        } catch {
+            // keep parsed.pathname
+        }
 
         res.setHeader('Cache-Control', 'no-store');
 
-        if (isManifest) {
+        if (shouldProbe) {
+            let sampleText = '';
+            let firstBytes = '';
+            if (upstream.body && upstream.headers.get('content-length') !== '0') {
+                try {
+                    const buf = await upstream.arrayBuffer();
+                    const bytes = new Uint8Array(buf.slice(0, 512));
+                    sampleText = Buffer.from(bytes).toString('utf8');
+                    firstBytes = Buffer.from(bytes.slice(0, 16)).toString('hex');
+                } catch {
+                    // ignore sample read error
+                }
+            }
+            return res.json({
+                contentType,
+                finalUrl: effectiveBaseUrl,
+                status: upstream.status,
+                firstBytes,
+                sampleText,
+            });
+        }
+
+        const isKnownHls =
+            effectivePathname.endsWith('.m3u8') ||
+            effectivePathname.endsWith('.m3u') ||
+            contentType.toLowerCase().includes('mpegurl');
+        const isKnownDash =
+            effectivePathname.endsWith('.mpd') ||
+            contentType.toLowerCase().includes('application/dash+xml');
+
+        if (isKnownHls) {
             const manifest = await upstream.text();
-            const rewritten = rewriteLiveManifest(manifest, parsed.toString(), req);
+            const rewritten = rewriteLiveManifest(manifest, effectiveBaseUrl, req, forwardOpts);
             res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
             return res.status(200).send(rewritten);
+        }
+
+        if (isKnownDash) {
+            const manifest = await upstream.text();
+            const rewritten = rewriteLiveDashManifest(manifest, effectiveBaseUrl, req, forwardOpts);
+            res.setHeader('Content-Type', 'application/dash+xml');
+            return res.status(200).send(rewritten);
+        }
+
+        const contentLength = parseInt(upstream.headers.get('content-length') || '0', 10);
+        const mightBeTextManifest =
+            contentType.startsWith('text/') ||
+            contentType.includes('xml') ||
+            (contentLength > 0 && contentLength < 256 * 1024 && !effectivePathname.endsWith('.ts') && !effectivePathname.endsWith('.m4s'));
+
+        if (mightBeTextManifest) {
+            const clone = upstream.clone();
+            const text = await clone.text();
+            const trimmed = text.trimStart();
+            if (trimmed.startsWith('#EXTM3U')) {
+                const rewritten = rewriteLiveManifest(text, effectiveBaseUrl, req, forwardOpts);
+                res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
+                return res.status(200).send(rewritten);
+            }
+            if ((trimmed.startsWith('<?xml') && trimmed.includes('<MPD')) || trimmed.startsWith('<MPD')) {
+                const rewritten = rewriteLiveDashManifest(text, effectiveBaseUrl, req, forwardOpts);
+                res.setHeader('Content-Type', 'application/dash+xml');
+                return res.status(200).send(rewritten);
+            }
         }
 
         if (contentType) {
