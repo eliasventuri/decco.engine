@@ -24,6 +24,18 @@ const activeDownloads = new Map(); // hash -> { engine, meta, interval }
 let downloadsWindow = null;
 const sseDownloadClients = new Set();
 
+function getDiskSpace() {
+    try {
+        if (typeof fs.statfsSync === 'function') {
+            const stats = fs.statfsSync(DOWNLOADS_DIR);
+            const free = Number(stats.bavail) * Number(stats.bsize);
+            const total = Number(stats.blocks) * Number(stats.bsize);
+            return { free, total, used: total - free };
+        }
+    } catch (_) {}
+    return null;
+}
+
 function getDownloadsPayload() {
     const result = [];
     const allMeta = loadDownloadsMeta();
@@ -51,7 +63,13 @@ function getDownloadsPayload() {
             });
         }
     }
-    return { downloads: result };
+    const settings = (allMeta && allMeta.settings) || { maxConcurrent: 2, autoPauseOnPlayback: true };
+    return {
+        downloads: result,
+        settings,
+        diskSpace: getDiskSpace(),
+        downloadDir: DOWNLOADS_DIR
+    };
 }
 
 let lastBroadcastPayload = '';
@@ -249,6 +267,7 @@ function loadDownloadsMeta() {
     try {
         if (fs.existsSync(DOWNLOADS_META_PATH)) {
             cachedDownloadsMeta = JSON.parse(fs.readFileSync(DOWNLOADS_META_PATH, 'utf-8'));
+            if (!cachedDownloadsMeta.settings) cachedDownloadsMeta.settings = { maxConcurrent: 2, autoPauseOnPlayback: true };
             return cachedDownloadsMeta;
         }
     } catch (e) {
@@ -261,7 +280,7 @@ function loadDownloadsMeta() {
             console.log('[Downloads] Failed to backup corrupted meta:', err.message);
         }
     }
-    cachedDownloadsMeta = { downloads: {} };
+    cachedDownloadsMeta = { downloads: {}, settings: { maxConcurrent: 2, autoPauseOnPlayback: true } };
     return cachedDownloadsMeta;
 }
 
@@ -421,12 +440,74 @@ function getFileProgress(engine, file) {
     }
 }
 
-function startDownload(hash, title, imdbId, season, episode, fileIdx) {
+function pumpDownloadQueue() {
+    const allMeta = loadDownloadsMeta();
+    const settings = (allMeta && allMeta.settings) || { maxConcurrent: 2, autoPauseOnPlayback: true };
+    const maxConcurrent = typeof settings.maxConcurrent === 'number' ? settings.maxConcurrent : 2;
+    let currentlyDownloading = 0;
+    for (const dl of activeDownloads.values()) {
+        if (dl.meta && (dl.meta.status === 'downloading' || dl.meta.status === 'loading')) {
+            currentlyDownloading++;
+        }
+    }
+    if (maxConcurrent > 0 && currentlyDownloading >= maxConcurrent) return;
+    const availableSlots = maxConcurrent === 0 ? 999 : (maxConcurrent - currentlyDownloading);
+    const queuedItems = Object.entries(allMeta.downloads)
+        .filter(([id, d]) => d.status === 'queued' && !activeDownloads.has(id))
+        .sort((a, b) => (a[1].queuePosition || a[1].startedAt || 0) - (b[1].queuePosition || b[1].startedAt || 0));
+    let started = 0;
+    for (const [id, item] of queuedItems) {
+        if (started >= availableSlots) break;
+        console.log('[Queue] Starting queued item:', item.title, id);
+        startDownload(item.hash, item.title, item.imdbId, item.season, item.episode, item.fileIdx, true);
+        started++;
+    }
+}
+
+function startDownload(hash, title, imdbId, season, episode, fileIdx, bypassQueue = false) {
     const downloadId = getDownloadId(hash, season, episode, fileIdx);
 
     if (activeDownloads.has(downloadId)) {
         console.log(`[Downloads] Already downloading: ${downloadId}`);
         return activeDownloads.get(downloadId).meta;
+    }
+
+    const allMeta = loadDownloadsMeta();
+    const settings = (allMeta && allMeta.settings) || { maxConcurrent: 2, autoPauseOnPlayback: true };
+    const maxConcurrent = typeof settings.maxConcurrent === 'number' ? settings.maxConcurrent : 2;
+    if (!bypassQueue && maxConcurrent > 0) {
+        let currentlyDownloading = 0;
+        for (const [key, dl] of activeDownloads.entries()) {
+            if (key !== downloadId && dl.meta && (dl.meta.status === 'downloading' || dl.meta.status === 'loading')) {
+                currentlyDownloading++;
+            }
+        }
+        if (currentlyDownloading >= maxConcurrent) {
+            console.log('[Downloads] Concurrency limit reached (' + currentlyDownloading + '/' + maxConcurrent + '). Queueing ' + title);
+            const existing = allMeta.downloads[downloadId] || {};
+            const meta = {
+                ...existing,
+                id: downloadId,
+                hash,
+                title: title || existing.title || 'Unknown',
+                imdbId: imdbId || existing.imdbId || '',
+                season: season || existing.season || 0,
+                episode: episode || existing.episode || 0,
+                fileIdx: fileIdx !== undefined ? fileIdx : existing.fileIdx,
+                status: 'queued',
+                progress: existing.progress || 0,
+                speed: 0,
+                peers: 0,
+                eta: null,
+                isStalled: false,
+                downloadDir: path.join(DOWNLOADS_DIR, hash.substring(0, 16)),
+                startedAt: existing.startedAt || Date.now(),
+                queuePosition: existing.queuePosition || Date.now()
+            };
+            persistDownloadMeta(downloadId, meta);
+            broadcastDownloadEvents();
+            return meta;
+        }
     }
 
     const downloadDir = path.join(DOWNLOADS_DIR, hash.substring(0, 16));
@@ -642,6 +723,7 @@ function startDownload(hash, title, imdbId, season, episode, fileIdx) {
                 // BitTorrent pieces can span file boundaries, so downloading one episode
                 // may cause adjacent episodes' data to also be written to disk.
                 cleanupUnwantedFiles(downloadDir, file.name);
+                pumpDownloadQueue(); // after comp
             } else {
                 broadcastDownloadEvents();
             }
@@ -2636,4 +2718,107 @@ serverApp.get('/download/open/:id', (req, res) => {
     }
 
     res.json({ status: 'opened', hash: entry.hash, id: entry.id });
+});
+
+
+// Batch and customization routes for Downloads
+serverApp.get('/download/pause-all', (req, res) => {
+    const allMeta = loadDownloadsMeta();
+    let count = 0;
+    for (const [dlId, active] of activeDownloads.entries()) {
+        if (active.interval) clearInterval(active.interval);
+        if (active.stalledTimeout) clearTimeout(active.stalledTimeout);
+        if (active.engine) {
+            try { active.engine.destroy(); } catch (e) {}
+        }
+        active.meta.status = 'paused';
+        active.meta.autoPausedForStream = false;
+        persistDownloadMeta(dlId, active.meta);
+        activeDownloads.delete(dlId);
+        count++;
+    }
+    for (const [id, item] of Object.entries(allMeta.downloads)) {
+        if (item.status === 'queued') {
+            item.status = 'paused';
+            count++;
+        }
+    }
+    saveDownloadsMeta(allMeta);
+    broadcastDownloadEvents();
+    res.json({ status: 'paused_all', count });
+});
+
+serverApp.get('/download/resume-all', (req, res) => {
+    const allMeta = loadDownloadsMeta();
+    let count = 0;
+    for (const [id, item] of Object.entries(allMeta.downloads)) {
+        if (item.status === 'paused') {
+            item.status = 'queued';
+            item.queuePosition = Date.now() + count;
+            count++;
+        }
+    }
+    saveDownloadsMeta(allMeta);
+    pumpDownloadQueue();
+    broadcastDownloadEvents();
+    res.json({ status: 'resumed_all', count });
+});
+
+serverApp.get('/download/clear-completed', (req, res) => {
+    const allMeta = loadDownloadsMeta();
+    let count = 0;
+    for (const [id, item] of Object.entries(allMeta.downloads)) {
+        if (item.status === 'completed') {
+            delete allMeta.downloads[id];
+            count++;
+        }
+    }
+    saveDownloadsMeta(allMeta);
+    broadcastDownloadEvents();
+    res.json({ status: 'cleared_completed', count });
+});
+
+serverApp.get('/download/settings', (req, res) => {
+    const allMeta = loadDownloadsMeta();
+    const settings = (allMeta && allMeta.settings) || { maxConcurrent: 2, autoPauseOnPlayback: true };
+    res.json({
+        settings,
+        diskSpace: getDiskSpace(),
+        downloadDir: DOWNLOADS_DIR
+    });
+});
+
+serverApp.all('/download/settings/set', (req, res) => {
+    const allMeta = loadDownloadsMeta();
+    if (!allMeta.settings) allMeta.settings = { maxConcurrent: 2, autoPauseOnPlayback: true };
+    const maxConcurrent = req.query.maxConcurrent ?? req.body?.maxConcurrent;
+    const autoPauseOnPlayback = req.query.autoPauseOnPlayback ?? req.body?.autoPauseOnPlayback;
+    if (maxConcurrent !== undefined) {
+        allMeta.settings.maxConcurrent = parseInt(maxConcurrent, 10);
+    }
+    if (autoPauseOnPlayback !== undefined) {
+        allMeta.settings.autoPauseOnPlayback = autoPauseOnPlayback === true || autoPauseOnPlayback === 'true' || autoPauseOnPlayback === 1 || autoPauseOnPlayback === '1';
+    }
+    saveDownloadsMeta(allMeta);
+    pumpDownloadQueue();
+    broadcastDownloadEvents();
+    res.json({ status: 'ok', settings: allMeta.settings });
+});
+
+serverApp.get('/download/force-start/:id', (req, res) => {
+    const { id } = req.params;
+    const allMeta = loadDownloadsMeta();
+    let saved = allMeta.downloads[id];
+    if (!saved) {
+        for (const [key, value] of Object.entries(allMeta.downloads)) {
+            if (value.hash === id) {
+                saved = value;
+                break;
+            }
+        }
+    }
+    if (!saved) return res.status(404).json({ error: 'Download not found' });
+    startDownload(saved.hash, saved.title, saved.imdbId, saved.season, saved.episode, saved.fileIdx, true);
+    broadcastDownloadEvents();
+    res.json({ status: 'started', hash: saved.hash, id: saved.id });
 });
