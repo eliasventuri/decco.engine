@@ -2103,6 +2103,20 @@ serverApp.get('/live/proxy', async (req, res) => {
     }
 });
 
+// Pre-warm endpoint: warm up .torrent HTTP cache and prepare engine before user clicks Play
+serverApp.get('/prewarm/:hash', async (req, res) => {
+    const { hash } = req.params;
+    if (!hash) return res.status(400).json({ error: 'Missing hash' });
+    cancelStopGraceTimeout(hash);
+    prefetchTorrentCacheFile(hash, DOWNLOAD_PATH).catch(() => {});
+    if (!activeEngines.has(hash)) {
+        try {
+            getEngine(hash);
+        } catch (_) {}
+    }
+    res.json({ status: 'prewarming', hash });
+});
+
 // HTTP Trigger to start engine (Bypasses custom protocol issues in Dev)
 serverApp.get('/start/:hash', (req, res) => {
     const hash = req.params.hash;

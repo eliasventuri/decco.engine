@@ -19,6 +19,7 @@ function patchFile(filePath, replacements) {
 
 const tsIndex = path.join(__dirname, '../node_modules/torrent-stream/index.js');
 const tsFileStream = path.join(__dirname, '../node_modules/torrent-stream/lib/file-stream.js');
+const pwsIndex = path.join(__dirname, '../node_modules/peer-wire-swarm/index.js');
 
 patchFile(tsIndex, [
     [
@@ -40,6 +41,10 @@ patchFile(tsIndex, [
     [
         '      if (!torrent.announce || !torrent.announce.length) {\n        opts.trackers = [].concat(opts.trackers || []).concat(link.announce || [])\n      }',
         '      if (!torrent.announce || !torrent.announce.length) {\n        opts.trackers = [].concat(opts.trackers || []).concat(link.announce || [])\n        torrent.announce = opts.trackers\n      }'
+    ],
+    [
+        'var swarm = pws(infoHash, opts.id, { size: (opts.connections || opts.size), speed: 10 })',
+        'var swarm = pws(infoHash, opts.id, { size: (opts.connections || opts.size), speed: 10, connectTimeout: 8000 })'
     ]
 ]);
 
@@ -47,6 +52,17 @@ patchFile(tsFileStream, [
     [
         '  this._critical = Math.min(1024 * 1024 / pieceLength, 2) | 0',
         '  this._critical = Math.max(1, Math.min(Math.ceil((16 * 1024 * 1024) / pieceLength), 8)) | 0'
+    ]
+]);
+
+patchFile(pwsIndex, [
+    [
+        'var CONNECTION_TIMEOUT = 3000;',
+        'var CONNECTION_TIMEOUT = 8000;'
+    ],
+    [
+        'if (!peer.reconnect || self._destroyed || peer.retries >= RECONNECT_WAIT.length) return self._remove(addr);',
+        'if (self._destroyed || peer.retries >= RECONNECT_WAIT.length) return self._remove(addr);'
     ]
 ]);
 
