@@ -53,5 +53,8 @@
             "include": "build/installer.nsh",
             "artifactName": "${name}-Setup-${version}.${ext}"
         }
+    },
+    "overrides": {
+        "tar": "^7.5.22"
     }
 }
