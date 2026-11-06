@@ -1,0 +1,21 @@
+[package]
+name = "decco-android"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[lib]
+name = "decco_engine"
+crate-type = ["cdylib", "staticlib"]
+
+[dependencies]
+decco-core = { path = "../decco-core" }
+tokio.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+parking_lot.workspace = true
+once_cell = "1.20"
+jni = "0.21"
+

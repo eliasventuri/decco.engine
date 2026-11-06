@@ -1,0 +1,8 @@
+/target
+**/*.rs.bk
+*.pdb
+*.so
+*.dll
+*.exe
+.env
+

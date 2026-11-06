@@ -1,0 +1,31 @@
+[package]
+name = "decco-desktop"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "decco-engine"
+path = "src/main.rs"
+
+[dependencies]
+decco-core = { path = "../decco-core" }
+tokio.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+anyhow.workspace = true
+parking_lot.workspace = true
+single-instance = "0.3"
+open = "5.3"
+tray-icon = "0.19"
+muda = "0.15"
+image = { version = "0.25", default-features = false, features = ["png", "ico"] }
+
+[target.'cfg(windows)'.dependencies]
+winreg = "0.52"
+windows-sys = { version = "0.59", features = ["Win32_UI_WindowsAndMessaging"] }
+
