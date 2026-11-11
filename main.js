@@ -54,12 +54,14 @@ function getDownloadsPayload() {
         } else {
             result.push({
                 ...entry,
-                progress: entry.status === 'completed' ? 1.0 : 0,
+                progress: entry.status === 'completed' ? 1.0 : (entry.progress || 0),
                 speed: 0,
                 peers: 0,
                 eta: null,
                 isStalled: false,
-                downloadedBytes: entry.status === 'completed' ? (entry.fileSize || 0) : 0
+                downloadedBytes: entry.status === 'completed' 
+                    ? (entry.fileSize || 0) 
+                    : (entry.downloadedBytes ?? Math.round((entry.progress || 0) * (entry.fileSize || 0)))
             });
         }
     }
@@ -622,9 +624,12 @@ function startDownload(hash, title, imdbId, season, episode, fileIdx, bypassQueu
         episode: episode || 0,
         fileIdx: fileIdx,
         status: isAlreadyCompleted ? 'completed' : 'loading',
-        progress: isAlreadyCompleted ? 1.0 : 0,
+        progress: isAlreadyCompleted ? 1.0 : (existingMeta ? (existingMeta.progress || 0) : 0),
         speed: 0,
         peers: 0,
+        downloadedBytes: isAlreadyCompleted
+            ? (existingMeta ? existingMeta.fileSize : 0)
+            : (existingMeta ? (existingMeta.downloadedBytes || Math.round((existingMeta.progress || 0) * (existingMeta.fileSize || 0))) : 0),
         fileName: existingMeta ? existingMeta.fileName : null,
         fileSize: existingMeta ? existingMeta.fileSize : 0,
         downloadDir,
@@ -761,6 +766,8 @@ function persistDownloadMeta(downloadId, meta) {
         downloadDir: meta.downloadDir,
         subtitles: meta.subtitles,
         status: meta.status,
+        progress: meta.progress ?? 0,
+        downloadedBytes: meta.downloadedBytes ?? Math.round((meta.progress || 0) * (meta.fileSize || 0)),
         autoPausedForStream: Boolean(meta.autoPausedForStream),
         startedAt: meta.startedAt,
         completedAt: meta.completedAt
