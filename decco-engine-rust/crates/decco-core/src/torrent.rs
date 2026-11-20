@@ -212,7 +212,9 @@ pub struct TorrentEngineManager {
     pub is_metered: Arc<RwLock<bool>>,
     pub primary_port: Arc<RwLock<u16>>,
     #[cfg(feature = "rqbit-backend")]
-    pub rqbit_session: Arc< tokio::sync::OnceCell<Arc<librqbit::Session>> >,
+    pub rqbit_session: Arc<tokio::sync::OnceCell<Arc<librqbit::Session>>>,
+    #[cfg(feature = "rqbit-backend")]
+    pub rqbit_handles: Arc<RwLock<HashMap<String, Arc<librqbit::ManagedTorrent>>>>,
 }
 
 impl TorrentEngineManager {
@@ -227,6 +229,8 @@ impl TorrentEngineManager {
             primary_port: Arc::new(RwLock::new(crate::config::DEFAULT_PRIMARY_PORT)),
             #[cfg(feature = "rqbit-backend")]
             rqbit_session: Arc::new(tokio::sync::OnceCell::new()),
+            #[cfg(feature = "rqbit-backend")]
+            rqbit_handles: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -235,10 +239,13 @@ impl TorrentEngineManager {
         let dir = self.config.streaming_cache_dir.clone();
         self.rqbit_session
             .get_or_try_init(|| async move {
-                info!("[DHT] Initializing persistent BitTorrent session and pre-warming DHT routing table...");
+                info!("[DHT] Initializing BitTorrent session (P2P listen + UPnP enabled, persistence disabled)...");
                 let mut opts = librqbit::SessionOptions::default();
                 opts.disable_dht = false;
-                opts.fastresume = true;
+                opts.fastresume = false;
+                opts.persistence = None;
+                opts.listen_port_range = Some(4240..4260);
+                opts.enable_upnp_port_forwarding = true;
                 let session = librqbit::Session::new_with_opts(dir, opts).await?;
                 Ok(session)
             })
@@ -400,6 +407,24 @@ impl TorrentEngineManager {
         {
             let mut guard = self.active_engines.write();
             if let Some(existing) = guard.get_mut(&clean_hash) {
+                let was_paused = existing.status == "paused";
+                if was_paused && !existing.is_mock {
+                    existing.status = if existing.metadata_ready {
+                        "ready".to_string()
+                    } else {
+                        "loading".to_string()
+                    };
+                    #[cfg(feature = "rqbit-backend")]
+                    if let Some(handle) = self.rqbit_handles.read().get(&clean_hash).cloned() {
+                        let mgr = Arc::clone(self);
+                        tokio::spawn(async move {
+                            if let Ok(session) = mgr.get_or_init_session().await {
+                                let _ = session.unpause(&handle).await;
+                            }
+                        });
+                    }
+                }
+
                 if let (Some(s), Some(e)) = (season, episode) {
                     if existing.metadata_ready && !existing.is_mock {
                         if let Some(re) = build_episode_pattern(s, e) {
@@ -416,7 +441,23 @@ impl TorrentEngineManager {
                                         "[Engine] Corrected file selection to: {} - Other files deselected",
                                         correct.name
                                     );
+                                    let target_idx = correct.index;
                                     existing.video_file = Some(correct);
+                                    #[cfg(feature = "rqbit-backend")]
+                                    if let Some(handle) =
+                                        self.rqbit_handles.read().get(&clean_hash).cloned()
+                                    {
+                                        let mgr = Arc::clone(self);
+                                        tokio::spawn(async move {
+                                            if let Ok(session) = mgr.get_or_init_session().await {
+                                                let mut only_files = HashSet::new();
+                                                only_files.insert(target_idx);
+                                                let _ = session
+                                                    .update_only_files(&handle, &only_files)
+                                                    .await;
+                                            }
+                                        });
+                                    }
                                 }
                             }
                         }
@@ -433,51 +474,9 @@ impl TorrentEngineManager {
         });
         let _ = std::fs::create_dir_all(&save_dir);
 
-        // If the video file is already present on disk in cache, register immediately
-        if let Some(existing_video) = find_exact_video_file(&save_dir, None) {
-            if let Ok(meta) = std::fs::metadata(&existing_video) {
-                if meta.len() > 0 {
-                    let fname = existing_video
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                        .unwrap_or("video.mp4")
-                        .to_string();
-                    let finfo = TorrentFileInfo {
-                        index: file_idx.unwrap_or(0),
-                        name: fname,
-                        path: existing_video.clone(),
-                        length: meta.len(),
-                        offset: 0,
-                    };
-                    let state = StreamEngineState {
-                        hash: clean_hash.clone(),
-                        status: "ready".to_string(),
-                        metadata_ready: true,
-                        is_mock: false,
-                        video_file: Some(finfo.clone()),
-                        files: vec![finfo],
-                        requested_file_idx: file_idx,
-                        requested_season: season,
-                        requested_episode: episode,
-                        duration: 0.0,
-                        video_codec: None,
-                        audio_codec: None,
-                        embedded_subtitles: None,
-                        progress: 0.0,
-                        peers: 0,
-                        download_speed_bytes: 0,
-                        piece_length: 1024 * 1024,
-                        save_dir: save_dir.clone(),
-                        error: None,
-                    };
-                    self.active_engines
-                        .write()
-                        .insert(clean_hash.clone(), state.clone());
-                }
-            }
-        }
-
-        let initial_state = StreamEngineState {
+        // If the video file is already present on disk in cache, register immediately as ready
+        // and avoid overwriting it with a `loading` state.
+        let mut initial_state = StreamEngineState {
             hash: clean_hash.clone(),
             status: "loading".to_string(),
             metadata_ready: false,
@@ -498,6 +497,29 @@ impl TorrentEngineManager {
             save_dir: save_dir.clone(),
             error: None,
         };
+
+        if let Some(existing_video) = find_exact_video_file(&save_dir, None) {
+            if let Ok(meta) = std::fs::metadata(&existing_video) {
+                if meta.len() > 0 {
+                    let fname = existing_video
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("video.mp4")
+                        .to_string();
+                    let finfo = TorrentFileInfo {
+                        index: file_idx.unwrap_or(0),
+                        name: fname,
+                        path: existing_video.clone(),
+                        length: meta.len(),
+                        offset: 0,
+                    };
+                    initial_state.status = "ready".to_string();
+                    initial_state.metadata_ready = true;
+                    initial_state.video_file = Some(finfo.clone());
+                    initial_state.files = vec![finfo];
+                }
+            }
+        }
 
         self.active_engines
             .write()
@@ -526,14 +548,86 @@ impl TorrentEngineManager {
                         librqbit::AddTorrent::from_url(build_magnet_uri(&hash_for_task))
                     };
 
+                    // Step 1: Resolve metadata with `list_only: true` so librqbit never preallocates
+                    // unwanted files in multi-file / season-pack torrents before file selection.
+                    let mut list_opts = librqbit::AddTorrentOptions::default();
+                    list_opts.list_only = true;
+                    list_opts.output_folder =
+                        Some(save_dir_for_task.to_string_lossy().to_string());
+
+                    let (final_target, only_files_vec) =
+                        match session.add_torrent(add_target, Some(list_opts)).await {
+                            Ok(librqbit::AddTorrentResponse::ListOnly(list_res)) => {
+                                let mut preview_files = Vec::new();
+                                let mut offset = 0u64;
+                                if let Ok(iter) = list_res.info.iter_file_details() {
+                                    for (idx, fd) in iter.enumerate() {
+                                        if let Ok(rel) = fd.filename.to_pathbuf() {
+                                            let name = rel
+                                                .file_name()
+                                                .and_then(|n| n.to_str())
+                                                .unwrap_or("video.mp4")
+                                                .to_string();
+                                            preview_files.push(TorrentFileInfo {
+                                                index: idx,
+                                                name,
+                                                path: save_dir_for_task.join(&rel),
+                                                length: fd.len,
+                                                offset,
+                                            });
+                                        }
+                                        offset += fd.len;
+                                    }
+                                }
+                                let only = select_target_video_file(
+                                    &preview_files,
+                                    file_idx,
+                                    season,
+                                    episode,
+                                )
+                                .map(|f| vec![f.index]);
+                                (
+                                    librqbit::AddTorrent::from_bytes(list_res.torrent_bytes),
+                                    only,
+                                )
+                            }
+                            Ok(other) => {
+                                if let Some(h) = other.into_handle() {
+                                    let _ = session
+                                        .delete(librqbit::api::TorrentIdOrHash::Id(h.id()), false)
+                                        .await;
+                                }
+                                (
+                                    librqbit::AddTorrent::from_url(build_magnet_uri(&hash_for_task)),
+                                    file_idx.map(|i| vec![i]),
+                                )
+                            }
+                            Err(e) => {
+                                error!("[Engine] Error resolving metadata for {}: {}", hash_for_task, e);
+                                let mut guard = mgr.active_engines.write();
+                                if let Some(eng) = guard.get_mut(&hash_for_task) {
+                                    eng.status = "error".to_string();
+                                    eng.error = Some(e.to_string());
+                                }
+                                return;
+                            }
+                        };
+
                     let mut add_opts = librqbit::AddTorrentOptions::default();
                     add_opts.overwrite = true;
+                    add_opts.only_files = only_files_vec;
                     add_opts.output_folder =
                         Some(save_dir_for_task.to_string_lossy().to_string());
 
-                    match session.add_torrent(add_target, Some(add_opts)).await {
+                    match session.add_torrent(final_target, Some(add_opts)).await {
                         Ok(response) => {
                             if let Some(handle) = response.into_handle() {
+                                {
+                                    mgr.rqbit_handles
+                                        .write()
+                                        .insert(hash_for_task.clone(), handle.clone());
+                                }
+                                let _ = session.unpause(&handle).await;
                                 let _ = handle.wait_until_initialized().await;
 
                                 let mut discovered_files = Vec::new();
@@ -679,17 +773,59 @@ impl TorrentEngineManager {
         initial_state
     }
 
-    pub fn pause_engine(&self, hash: &str) {
+    #[cfg(feature = "rqbit-backend")]
+    pub fn open_stream_for_hash(
+        &self,
+        hash: &str,
+    ) -> Option<impl tokio::io::AsyncRead + tokio::io::AsyncSeek + Unpin + Send + 'static> {
+        let clean_hash = hash.trim().to_ascii_lowercase();
+        let file_idx = {
+            let guard = self.active_engines.read();
+            let eng = guard.get(&clean_hash)?;
+            if eng.is_mock {
+                return None;
+            }
+            eng.video_file.as_ref()?.index
+        };
+        let handle = self.rqbit_handles.read().get(&clean_hash)?.clone();
+        handle.stream(file_idx).ok()
+    }
+
+    pub fn pause_engine(self: &Arc<Self>, hash: &str) {
         let clean_hash = hash.trim().to_ascii_lowercase();
         if let Some(eng) = self.active_engines.write().get_mut(&clean_hash) {
             eng.status = "paused".to_string();
         }
+        #[cfg(feature = "rqbit-backend")]
+        if let Some(handle) = self.rqbit_handles.read().get(&clean_hash).cloned() {
+            let mgr = Arc::clone(self);
+            if let Ok(rt) = tokio::runtime::Handle::try_current() {
+                rt.spawn(async move {
+                    if let Ok(session) = mgr.get_or_init_session().await {
+                        let _ = session.pause(&handle).await;
+                    }
+                });
+            }
+        }
         info!("[Engine] Paused engine for {}", clean_hash);
     }
 
-    pub fn destroy_engine(&self, hash: &str) -> Option<PathBuf> {
+    pub fn destroy_engine(self: &Arc<Self>, hash: &str) -> Option<PathBuf> {
         let clean_hash = hash.trim().to_ascii_lowercase();
         self.cancel_stop_grace_timeout(&clean_hash);
+        #[cfg(feature = "rqbit-backend")]
+        if let Some(handle) = self.rqbit_handles.write().remove(&clean_hash) {
+            let mgr = Arc::clone(self);
+            if let Ok(rt) = tokio::runtime::Handle::try_current() {
+                rt.spawn(async move {
+                    if let Ok(session) = mgr.get_or_init_session().await {
+                        let _ = session
+                            .delete(librqbit::api::TorrentIdOrHash::Id(handle.id()), false)
+                            .await;
+                    }
+                });
+            }
+        }
         let removed = self.active_engines.write().remove(&clean_hash);
         if let Some(ref eng) = removed {
             info!("[Engine] Destroyed streaming engine for {}", clean_hash);
@@ -698,25 +834,44 @@ impl TorrentEngineManager {
         None
     }
 
+    pub fn destroy_all_engines(self: &Arc<Self>) {
+        let keys: Vec<String> = self.active_engines.read().keys().cloned().collect();
+        for hash in keys {
+            self.destroy_engine(&hash);
+        }
+    }
+
+    pub fn destroy_engines_except(self: &Arc<Self>, protected_hashes: &HashSet<String>) {
+        let keys: Vec<String> = self.active_engines.read().keys().cloned().collect();
+        for hash in keys {
+            if !protected_hashes.contains(&hash) {
+                self.destroy_engine(&hash);
+            }
+        }
+    }
+
     /// Stops all competing streaming engines other than `target_hash`
-    pub fn stop_competing_streams(&self, target_hash: &str, shared_download_hashes: &HashSet<String>) {
+    pub fn stop_competing_streams(
+        self: &Arc<Self>,
+        target_hash: &str,
+        shared_download_hashes: &HashSet<String>,
+    ) {
         let target = target_hash.trim().to_ascii_lowercase();
         self.cancel_stop_grace_timeout(&target);
         *self.active_streaming_hash.write() = Some(target.clone());
 
-        let mut guard = self.active_engines.write();
-        let keys: Vec<String> = guard.keys().cloned().collect();
+        let keys: Vec<String> = self.active_engines.read().keys().cloned().collect();
         for other_hash in keys {
             if other_hash == target {
                 continue;
             }
             if shared_download_hashes.contains(&other_hash) {
-                guard.remove(&other_hash);
+                self.active_engines.write().remove(&other_hash);
                 continue;
             }
-            guard.remove(&other_hash);
+            self.destroy_engine(&other_hash);
             info!(
-                "[Engine] Paused previous streaming engine for {} to prioritize {}",
+                "[Engine] Stopped previous streaming engine for {} to prioritize {}",
                 other_hash, target
             );
         }
@@ -744,6 +899,51 @@ impl TorrentEngineManager {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mk_file(index: usize, name: &str, length: u64, offset: u64) -> TorrentFileInfo {
+        TorrentFileInfo {
+            index,
+            name: name.to_string(),
+            path: PathBuf::from(name),
+            length,
+            offset,
+        }
+    }
+
+    #[test]
+    fn select_target_video_file_prioritizes_episode_then_idx_then_largest() {
+        let files = vec![
+            mk_file(0, "Show.S01E01.1080p.mkv", 1_000_000, 0),
+            mk_file(1, "Show.S01E02.1080p.mkv", 2_000_000, 1_000_000),
+            mk_file(2, "readme.txt", 500, 3_000_000),
+        ];
+
+        // Priority 1: Episode regex overrides file_idx
+        let ep1 = select_target_video_file(&files, Some(1), Some(1), Some(1)).unwrap();
+        assert_eq!(ep1.index, 0);
+
+        // Priority 2: Explicit file_idx when no season/episode
+        let idx0 = select_target_video_file(&files, Some(0), None, None).unwrap();
+        assert_eq!(idx0.index, 0);
+
+        // Priority 3: Largest video file fallback
+        let largest = select_target_video_file(&files, None, None, None).unwrap();
+        assert_eq!(largest.index, 1);
+    }
+
+    #[test]
+    fn compute_critical_piece_window_bounds() {
+        let f = mk_file(0, "movie.mkv", 50_000_000, 10_000_000);
+        let (start, width) = compute_critical_piece_window(&f, 0, 4 * 1024 * 1024).unwrap();
+        assert_eq!(start, 2);
+        assert!((2..=8).contains(&width));
+        assert!(compute_critical_piece_window(&f, 0, 0).is_none());
     }
 }
 

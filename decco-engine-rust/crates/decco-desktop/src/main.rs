@@ -12,16 +12,34 @@ use muda::MenuEvent;
 use single_instance::SingleInstance;
 use std::sync::Arc;
 use tracing::{info, warn};
+use tracing_subscriber::fmt::writer::MakeWriterExt;
 use updater::UpdaterState;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info".into()),
-        )
-        .init();
+    let config = EngineConfig::default_desktop();
+
+    let log_file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&config.log_file_path)
+        .ok();
+
+    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| "info".into());
+
+    if let Some(file) = log_file {
+        let multi = std::sync::Mutex::new(file).and(std::io::stderr);
+        tracing_subscriber::fmt()
+            .with_env_filter(env_filter)
+            .with_writer(multi)
+            .with_ansi(false)
+            .init();
+    } else {
+        tracing_subscriber::fmt()
+            .with_env_filter(env_filter)
+            .init();
+    }
 
     let args: Vec<String> = std::env::args().collect();
     let protocol_url = args.iter().find(|a| a.starts_with("decco://")).cloned();
@@ -38,7 +56,6 @@ async fn main() -> anyhow::Result<()> {
     // Register Windows Protocol (`decco://`) and Auto-Start (`HKCU\...\Run`)
     protocol::register_windows_integration();
 
-    let config = EngineConfig::default_desktop();
     let updater = Arc::new(UpdaterState::new(config.update_info_path.clone()));
 
     let engine = DeccoEngine::new(config);

@@ -13,6 +13,7 @@ use crate::server::{start_multiport_server, AppState};
 use crate::torrent::TorrentEngineManager;
 use regex::Regex;
 use std::sync::Arc;
+use tokio::sync::watch;
 use tracing::info;
 
 #[derive(Clone)]
@@ -31,14 +32,29 @@ impl DeccoEngine {
             config,
             Arc::clone(&torrent_mgr),
         ));
+        let (shutdown, _) = watch::channel(false);
+        let http_client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(12))
+            .redirect(reqwest::redirect::Policy::limited(10))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
 
         Self {
             state: AppState {
                 torrent_mgr,
                 downloads_mgr,
                 cache_mgr,
+                shutdown,
+                auth_token: None,
+                http_client,
             },
         }
+    }
+
+    pub fn new_with_auth(config: EngineConfig, auth_token: String) -> Self {
+        let mut engine = Self::new(config);
+        engine.state.auth_token = Some(auth_token);
+        engine
     }
 
     /// Starts the multi-port HTTP server and background workers
@@ -86,8 +102,16 @@ impl DeccoEngine {
     }
 
     pub fn clear_cache(&self) -> anyhow::Result<()> {
-        self.state.torrent_mgr.active_engines.write().clear();
+        let protected = self.state.downloads_mgr.protected_download_hashes();
+        self.state.torrent_mgr.destroy_engines_except(&protected);
         self.state.cache_mgr.clear_all_streaming_cache()
+    }
+
+    /// Stops active download/stream work while keeping the engine object reusable.
+    pub fn shutdown(&self) {
+        self.state.torrent_mgr.destroy_all_engines();
+        self.state.downloads_mgr.pause_all_downloads();
+        let _ = self.state.shutdown.send(true);
     }
 }
 

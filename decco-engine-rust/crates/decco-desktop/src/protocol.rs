@@ -43,21 +43,68 @@ pub fn register_windows_integration() {
     }
 }
 
-/// When a second instance is launched with a `decco://` URL, forwards the link to the primary running instance via HTTP
-pub async fn forward_link_to_running_instance(url: &str, primary_port: u16) {
-    let engine = decco_core::DeccoEngine::new(decco_core::config::EngineConfig::default_desktop());
-    // Parse and trigger /start/:hash on loopback
-    if let Some(rest) = url.strip_prefix("decco://") {
-        let hash: String = rest
-            .chars()
-            .take_while(|c| c.is_ascii_hexdigit())
-            .collect();
-        if !hash.is_empty() {
-            let target = format!("http://127.0.0.1:{}/start/{}", primary_port, hash);
-            let _ = reqwest::get(&target).await;
-            return;
+/// Extracts `(hash, query_string)` from a `decco://<hash>?fileIdx=...&season=...&episode=...` URI
+pub fn parse_protocol_start_path(url: &str) -> Option<String> {
+    let rest = url.strip_prefix("decco://")?;
+    let hash: String = rest
+        .chars()
+        .take_while(|c| c.is_ascii_hexdigit())
+        .collect();
+    if hash.is_empty() {
+        return None;
+    }
+    let lower_hash = hash.to_ascii_lowercase();
+    if let Some((_, query)) = rest.split_once('?') {
+        if !query.is_empty() {
+            return Some(format!("/start/{}?{}", lower_hash, query));
         }
     }
+    Some(format!("/start/{}", lower_hash))
+}
+
+/// When a second instance is launched with a `decco://` URL, forwards the link to the primary running instance via HTTP
+pub async fn forward_link_to_running_instance(url: &str, primary_port: u16) {
+    if let Some(start_path) = parse_protocol_start_path(url) {
+        let mut ports = vec![primary_port];
+        for &p in decco_core::config::PORTS_TO_TRY {
+            if p != primary_port {
+                ports.push(p);
+            }
+        }
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(2))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
+
+        for port in ports {
+            let target = format!("http://127.0.0.1:{}{}", port, start_path);
+            if let Ok(resp) = client.get(&target).send().await {
+                if resp.status().is_success() {
+                    return;
+                }
+            }
+        }
+    }
+
+    let engine = decco_core::DeccoEngine::new(decco_core::config::EngineConfig::default_desktop());
     engine.handle_protocol_link(url).await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_protocol_start_path_preserves_query_params() {
+        assert_eq!(
+            parse_protocol_start_path("decco://ABCDEF0123456789?fileIdx=2&season=1&episode=3"),
+            Some("/start/abcdef0123456789?fileIdx=2&season=1&episode=3".to_string())
+        );
+        assert_eq!(
+            parse_protocol_start_path("decco://deadbeef"),
+            Some("/start/deadbeef".to_string())
+        );
+        assert_eq!(parse_protocol_start_path("https://example.com"), None);
+    }
 }
 

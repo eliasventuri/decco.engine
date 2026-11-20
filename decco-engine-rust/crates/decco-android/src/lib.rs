@@ -5,6 +5,7 @@ use jni::JNIEnv;
 use once_cell::sync::OnceCell;
 use parking_lot::Mutex;
 use std::path::PathBuf;
+use std::sync::OnceLock;
 use tokio::runtime::Runtime;
 use tracing::info;
 
@@ -14,6 +15,11 @@ struct AndroidEngineRuntime {
 }
 
 static ANDROID_RUNTIME: OnceCell<AndroidEngineRuntime> = OnceCell::new();
+static AUTH_TOKEN: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+
+fn auth_token() -> &'static Mutex<Option<String>> {
+    AUTH_TOKEN.get_or_init(|| Mutex::new(None))
+}
 
 fn get_runtime() -> &'static AndroidEngineRuntime {
     ANDROID_RUNTIME.get_or_init(|| {
@@ -63,7 +69,10 @@ pub extern "system" fn Java_com_decco_core_engine_RustEngineBridge_startEngine<'
         config.ports = vec![port as u16, 18889, 18888];
     }
 
-    let engine = DeccoEngine::new(config);
+    let token = auth_token().lock().clone();
+    let engine = token
+        .map(|value| DeccoEngine::new_with_auth(config.clone(), value))
+        .unwrap_or_else(|| DeccoEngine::new(config));
     let engine_clone = engine.clone();
 
     let bound_port = runtime.rt.block_on(async move {
@@ -82,6 +91,19 @@ pub extern "system" fn Java_com_decco_core_engine_RustEngineBridge_startEngine<'
     }
 
     bound_port
+}
+
+/// JNI Entrypoint: `com.decco.core.engine.RustEngineBridge.configureAuthToken(token: String)`
+#[no_mangle]
+pub extern "system" fn Java_com_decco_core_engine_RustEngineBridge_configureAuthToken<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    token: JString<'local>,
+) {
+    let Ok(token) = env.get_string(&token) else {
+        return;
+    };
+    *auth_token().lock() = Some(token.into());
 }
 
 /// JNI Entrypoint: `com.decco.core.engine.RustEngineBridge.setMeteredMode(isMetered: Boolean)`
@@ -171,8 +193,22 @@ pub extern "system" fn Java_com_decco_core_engine_RustEngineBridge_pauseAllTorre
     let runtime = get_runtime();
     let guard = runtime.engine.lock();
     if let Some(ref engine) = *guard {
-        engine.state.torrent_mgr.active_engines.write().clear();
+        engine.state.torrent_mgr.destroy_all_engines();
         engine.state.downloads_mgr.pause_all_downloads();
+    }
+}
+
+/// JNI Entrypoint: `com.decco.core.engine.RustEngineBridge.shutdown()`
+#[no_mangle]
+pub extern "system" fn Java_com_decco_core_engine_RustEngineBridge_shutdown<'local>(
+    _env: JNIEnv<'local>,
+    _class: JClass<'local>,
+) {
+    let runtime = get_runtime();
+    let mut guard = runtime.engine.lock();
+    if let Some(engine) = guard.take() {
+        engine.shutdown();
+        info!("[Android-JNI] Rust Engine state shut down");
     }
 }
 

@@ -29,7 +29,17 @@ fn load_tray_icon() -> Icon {
         }
     }
 
-    // Fallback 16x16 red/dark icon if icon.png is not in current working dir
+    // Embedded Decco icon so tray always shows the real icon regardless of working directory
+    let embedded_png = include_bytes!("../../../../icon.png");
+    if let Ok(img) = image::load_from_memory(embedded_png) {
+        let rgba = img.into_rgba8();
+        let (w, h) = rgba.dimensions();
+        if let Ok(ic) = Icon::from_rgba(rgba.into_raw(), w, h) {
+            return ic;
+        }
+    }
+
+    // Fallback 16x16 red/dark icon if decoding fails
     let mut rgba = Vec::with_capacity(16 * 16 * 4);
     for _ in 0..(16 * 16) {
         rgba.extend_from_slice(&[229, 9, 20, 255]);

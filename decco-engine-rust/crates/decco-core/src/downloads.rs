@@ -2,7 +2,7 @@ use crate::config::{
     find_exact_video_file, get_download_id, is_video_file, now_ms, EngineConfig,
     AUTO_RESUME_DELAY_MS, STALLED_TIMEOUT_MS, STOP_GRACE_PERIOD_MS,
 };
-use crate::torrent::{prefetch_torrent_cache_file, TorrentEngineManager};
+use crate::torrent::TorrentEngineManager;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -45,6 +45,8 @@ pub struct DownloadItemMeta {
     pub hash: String,
     pub title: String,
     pub imdb_id: String,
+    #[serde(default)]
+    pub poster: String,
     pub season: u32,
     pub episode: u32,
     pub file_idx: Option<usize>,
@@ -113,6 +115,8 @@ pub struct DownloadsManager {
     pub sse_tx: broadcast::Sender<String>,
     last_broadcast_payload: Arc<RwLock<String>>,
     auto_resume_handle: Arc<RwLock<Option<JoinHandle<()>>>>,
+    disk_space_cache: Arc<RwLock<Option<(std::time::Instant, DiskSpaceInfo)>>>,
+    meta_save_lock: Arc<parking_lot::Mutex<()>>,
 }
 
 impl DownloadsManager {
@@ -127,6 +131,8 @@ impl DownloadsManager {
             sse_tx,
             last_broadcast_payload: Arc::new(RwLock::new(String::new())),
             auto_resume_handle: Arc::new(RwLock::new(None)),
+            disk_space_cache: Arc::new(RwLock::new(None)),
+            meta_save_lock: Arc::new(parking_lot::Mutex::new(())),
         }
     }
 
@@ -156,15 +162,38 @@ impl DownloadsManager {
     pub fn save_downloads_meta(&self) {
         let snapshot = self.db.read().clone();
         let path = self.config.downloads_meta_path.clone();
-        let temp_path = path.with_extension(format!("json.tmp.{}", now_ms()));
+        let lock = Arc::clone(&self.meta_save_lock);
+        Self::write_downloads_meta_snapshot(&snapshot, &path, &lock);
+    }
 
-        if let Ok(json_str) = serde_json::to_string_pretty(&snapshot) {
+    fn write_downloads_meta_snapshot(
+        snapshot: &DownloadsDatabase,
+        path: &Path,
+        lock: &parking_lot::Mutex<()>,
+    ) {
+        let _guard = lock.lock();
+        let temp_path = path.with_extension(format!("json.tmp.{}", now_ms()));
+        if let Ok(json_str) = serde_json::to_string_pretty(snapshot) {
             if std::fs::write(&temp_path, &json_str).is_ok() {
-                if std::fs::rename(&temp_path, &path).is_err() {
-                    let _ = std::fs::write(&path, &json_str);
+                if std::fs::rename(&temp_path, path).is_err() {
+                    let _ = std::fs::write(path, &json_str);
                     let _ = std::fs::remove_file(&temp_path);
                 }
             }
+        }
+    }
+
+    /// Offloads metadata persistence to a blocking thread so HTTP handlers return immediately.
+    pub fn save_downloads_meta_async(&self) {
+        let snapshot = self.db.read().clone();
+        let path = self.config.downloads_meta_path.clone();
+        let lock = Arc::clone(&self.meta_save_lock);
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn_blocking(move || {
+                Self::write_downloads_meta_snapshot(&snapshot, &path, &lock);
+            });
+        } else {
+            Self::write_downloads_meta_snapshot(&snapshot, &path, &lock);
         }
     }
 
@@ -176,7 +205,24 @@ impl DownloadsManager {
         self.save_downloads_meta();
     }
 
+    pub fn persist_download_meta_async(&self, download_id: &str, meta: &DownloadItemMeta) {
+        {
+            let mut guard = self.db.write();
+            guard.downloads.insert(download_id.to_string(), meta.clone());
+        }
+        self.save_downloads_meta_async();
+    }
+
     pub fn get_disk_space(&self) -> Option<DiskSpaceInfo> {
+        {
+            let cache_guard = self.disk_space_cache.read();
+            if let Some((captured_at, ref cached)) = *cache_guard {
+                if captured_at.elapsed() < Duration::from_secs(15) {
+                    return Some(cached.clone());
+                }
+            }
+        }
+
         let disks = Disks::new_with_refreshed_list();
         let target_dir = &self.config.completed_downloads_dir;
         let mut best_match: Option<&sysinfo::Disk> = None;
@@ -196,11 +242,13 @@ impl DownloadsManager {
         let disk = best_match.or_else(|| disks.list().first())?;
         let total = disk.total_space();
         let free = disk.available_space();
-        Some(DiskSpaceInfo {
+        let info = DiskSpaceInfo {
             free,
             total,
             used: total.saturating_sub(free),
-        })
+        };
+        *self.disk_space_cache.write() = Some((std::time::Instant::now(), info.clone()));
+        Some(info)
     }
 
     pub fn get_downloads_payload(&self) -> DownloadsPayload {
@@ -208,9 +256,31 @@ impl DownloadsManager {
         let active_guard = self.active_downloads.read();
         let mut result = Vec::with_capacity(db_guard.downloads.len());
 
+        let active_engines_guard = self.torrent_mgr.active_engines.read();
         for (download_id, entry) in &db_guard.downloads {
             if let Some(active) = active_guard.get(download_id) {
                 let mut item = active.meta.clone();
+                if let Some(eng) = active_engines_guard.get(&item.hash) {
+                    if let Some(ref vf) = eng.video_file {
+                        if item.file_name.is_none() {
+                            item.file_name = Some(vf.name.clone());
+                        }
+                        if item.file_size == 0 {
+                            item.file_size = vf.length;
+                        }
+                        if item.status == "loading" {
+                            item.status = "downloading".to_string();
+                        }
+                    }
+                    if item.status == "downloading" {
+                        item.progress = eng.progress.max(item.progress);
+                        item.speed = eng.download_speed_bytes;
+                        item.peers = eng.peers;
+                        if item.speed > 0 || item.peers > 0 || item.progress > 0.0 {
+                            item.is_stalled = false;
+                        }
+                    }
+                }
                 if item.downloaded_bytes == 0 && item.file_size > 0 {
                     item.downloaded_bytes = (item.progress * item.file_size as f64).round() as u64;
                 }
@@ -446,6 +516,29 @@ impl DownloadsManager {
         file_idx: Option<usize>,
         bypass_queue: bool,
     ) -> DownloadItemMeta {
+        self.start_download_with_poster(
+            hash,
+            title,
+            imdb_id,
+            "",
+            season,
+            episode,
+            file_idx,
+            bypass_queue,
+        )
+    }
+
+    pub fn start_download_with_poster(
+        self: &Arc<Self>,
+        hash: &str,
+        title: &str,
+        imdb_id: &str,
+        poster: &str,
+        season: u32,
+        episode: u32,
+        file_idx: Option<usize>,
+        bypass_queue: bool,
+    ) -> DownloadItemMeta {
         let clean_hash = hash.trim().to_ascii_lowercase();
         let download_id = get_download_id(
             &clean_hash,
@@ -490,6 +583,14 @@ impl DownloadsManager {
                     currently_downloading, max_concurrent, title
                 );
                 let now = now_ms();
+                let resolved_poster = if !poster.trim().is_empty() {
+                    poster.trim().to_string()
+                } else {
+                    existing_entry
+                        .as_ref()
+                        .map(|e| e.poster.clone())
+                        .unwrap_or_default()
+                };
                 let meta = DownloadItemMeta {
                     id: download_id.clone(),
                     hash: clean_hash,
@@ -502,6 +603,7 @@ impl DownloadsManager {
                             .unwrap_or_else(|| "Unknown".to_string())
                     },
                     imdb_id: imdb_id.to_string(),
+                    poster: resolved_poster,
                     season,
                     episode,
                     file_idx,
@@ -526,15 +628,13 @@ impl DownloadsManager {
                     duration: existing_entry.as_ref().and_then(|e| e.duration),
                     last_error: None,
                 };
-                self.persist_download_meta(&download_id, &meta);
+                self.persist_download_meta_async(&download_id, &meta);
                 self.broadcast_download_events();
                 return meta;
             }
         }
 
-        let _ = std::fs::create_dir_all(&download_dir_path);
-
-        // Hot upgrade from active streaming engine if present
+        // Hot upgrade: capture streaming engine path quickly (in-memory only); offload fs moves to background task
         let was_streaming = {
             let guard = self.torrent_mgr.active_engines.read();
             guard
@@ -542,35 +642,40 @@ impl DownloadsManager {
                 .map(|e| !e.is_mock)
                 .unwrap_or(false)
         };
-
-        if was_streaming {
+        let migration_src_path = if was_streaming {
             info!(
                 "[Downloads] Found active streaming engine for {}. Upgrading to permanent download...",
                 clean_hash
             );
-            if let Some(src_path) = self.torrent_mgr.destroy_engine(&clean_hash) {
-                if src_path.exists() && src_path != download_dir_path {
-                    if let Ok(entries) = std::fs::read_dir(&src_path) {
-                        for entry in entries.flatten() {
-                            let src_item = entry.path();
-                            if let Some(name) = src_item.file_name() {
-                                let dest_item = download_dir_path.join(name);
-                                let _ = std::fs::rename(&src_item, &dest_item);
-                            }
-                        }
-                    }
-                    let _ = std::fs::remove_dir_all(&src_path);
-                    self.torrent_mgr.cache.remove_torrent(&clean_hash);
-                    info!("[Downloads] Moved cached stream files to permanent download dir.");
+            self.torrent_mgr.destroy_engine(&clean_hash)
+        } else {
+            None
+        };
+
+        let existing_meta = self.db.read().downloads.get(&download_id).cloned();
+        if let Some(ref existing) = existing_meta {
+            if existing.status == "completed" {
+                if find_exact_video_file(
+                    Path::new(&existing.download_dir),
+                    existing.file_name.as_deref(),
+                )
+                .is_some()
+                {
+                    info!("[Downloads] Already completed on disk: {}", download_id);
+                    return existing.clone();
                 }
             }
         }
+        let is_already_completed = false;
 
-        let existing_meta = self.db.read().downloads.get(&download_id).cloned();
-        let is_already_completed = existing_meta
-            .as_ref()
-            .map(|m| m.status == "completed")
-            .unwrap_or(false);
+        let resolved_poster = if !poster.trim().is_empty() {
+            poster.trim().to_string()
+        } else {
+            existing_meta
+                .as_ref()
+                .map(|m| m.poster.clone())
+                .unwrap_or_default()
+        };
 
         let now = now_ms();
         let meta = DownloadItemMeta {
@@ -582,6 +687,7 @@ impl DownloadsManager {
                 "Unknown".to_string()
             },
             imdb_id: imdb_id.to_string(),
+            poster: resolved_poster,
             season,
             episode,
             file_idx,
@@ -611,7 +717,17 @@ impl DownloadsManager {
             last_error: None,
         };
 
-        self.persist_download_meta(&download_id, &meta);
+        // Update state and notify listeners immediately before any filesystem or torrent I/O
+        self.persist_download_meta_async(&download_id, &meta);
+        self.active_downloads.write().insert(
+            download_id.clone(),
+            ActiveDownloadTask {
+                meta: meta.clone(),
+                poll_handle: None,
+                stalled_handle: None,
+            },
+        );
+        self.broadcast_download_events();
 
         // Stalled detection timer (45s)
         let dl_mgr_stalled = Arc::clone(self);
@@ -645,7 +761,30 @@ impl DownloadsManager {
         let dl_dir_poll = download_dir_path.clone();
 
         let poll_handle = tokio::spawn(async move {
-            let _ = prefetch_torrent_cache_file(&hash_poll, &dl_dir_poll).await;
+            let dl_dir_setup = dl_dir_poll.clone();
+            let hash_setup = hash_poll.clone();
+            let cache_mgr = dl_mgr.torrent_mgr.cache.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                let _ = std::fs::create_dir_all(&dl_dir_setup);
+                if let Some(src_path) = migration_src_path {
+                    if src_path.exists() && src_path != dl_dir_setup {
+                        if let Ok(entries) = std::fs::read_dir(&src_path) {
+                            for entry in entries.flatten() {
+                                let src_item = entry.path();
+                                if let Some(name) = src_item.file_name() {
+                                    let dest_item = dl_dir_setup.join(name);
+                                    let _ = std::fs::rename(&src_item, &dest_item);
+                                }
+                            }
+                        }
+                        let _ = std::fs::remove_dir_all(&src_path);
+                        cache_mgr.remove_torrent(&hash_setup);
+                        info!("[Downloads] Moved cached stream files to permanent download dir.");
+                    }
+                }
+            })
+            .await;
+
             let _ = dl_mgr
                 .torrent_mgr
                 .start_or_get_engine(
@@ -676,16 +815,23 @@ impl DownloadsManager {
                 if eng.metadata_ready && !subs_fetched {
                     subs_fetched = true;
                     if let Some(ref vf) = eng.video_file {
-                        let subs = Self::download_subtitles(&imdb_poll, season, episode, &vf.path).await;
-                        if !subs.is_empty() {
-                            let mut guard = dl_mgr.active_downloads.write();
-                            if let Some(active) = guard.get_mut(&dl_id_poll) {
-                                active.meta.subtitles = subs;
-                                let meta_clone = active.meta.clone();
-                                drop(guard);
-                                dl_mgr.persist_download_meta(&dl_id_poll, &meta_clone);
+                        let dl_mgr_subs = Arc::clone(&dl_mgr);
+                        let dl_id_subs = dl_id_poll.clone();
+                        let imdb_subs = imdb_poll.clone();
+                        let vf_path = vf.path.clone();
+                        tokio::spawn(async move {
+                            let subs = Self::download_subtitles(&imdb_subs, season, episode, &vf_path).await;
+                            if !subs.is_empty() {
+                                let mut guard = dl_mgr_subs.active_downloads.write();
+                                if let Some(active) = guard.get_mut(&dl_id_subs) {
+                                    active.meta.subtitles = subs;
+                                    let meta_clone = active.meta.clone();
+                                    drop(guard);
+                                    dl_mgr_subs.persist_download_meta(&dl_id_subs, &meta_clone);
+                                    dl_mgr_subs.broadcast_download_events();
+                                }
                             }
-                        }
+                        });
                     }
                 }
 
@@ -759,16 +905,11 @@ impl DownloadsManager {
             }
         });
 
-        self.active_downloads.write().insert(
-            download_id,
-            ActiveDownloadTask {
-                meta: meta.clone(),
-                poll_handle: Some(poll_handle),
-                stalled_handle: Some(stalled_handle),
-            },
-        );
+        if let Some(active) = self.active_downloads.write().get_mut(&download_id) {
+            active.poll_handle = Some(poll_handle);
+            active.stalled_handle = Some(stalled_handle);
+        }
 
-        self.broadcast_download_events();
         meta
     }
 
@@ -802,8 +943,14 @@ impl DownloadsManager {
             self.torrent_mgr.destroy_engine(&active.meta.hash);
             active.meta.status = "paused".to_string();
             active.meta.auto_paused_for_stream = false;
-            self.persist_download_meta(&download_id, &active.meta);
+            {
+                let mut db_guard = self.db.write();
+                db_guard
+                    .downloads
+                    .insert(download_id.clone(), active.meta.clone());
+            }
             self.broadcast_download_events();
+            self.save_downloads_meta_async();
             return Some(active.meta.clone());
         }
 
@@ -813,8 +960,8 @@ impl DownloadsManager {
             saved.auto_paused_for_stream = false;
             let cloned = saved.clone();
             drop(db_guard);
-            self.save_downloads_meta();
             self.broadcast_download_events();
+            self.save_downloads_meta_async();
             return Some(cloned);
         }
         None
@@ -873,7 +1020,11 @@ impl DownloadsManager {
             .map(|e| e.hash.clone())
             .unwrap_or_else(|| id_or_hash.to_string());
 
-        if let Some(ref item) = entry {
+        // Broadcast SSE removal and return HTTP response immediately before disk cleanup
+        self.broadcast_download_events();
+        self.save_downloads_meta_async();
+
+        if let Some(item) = entry {
             let other_shares_hash = self
                 .db
                 .read()
@@ -881,18 +1032,23 @@ impl DownloadsManager {
                 .values()
                 .any(|d| d.hash == item.hash && d.id != item.id);
 
+            if !other_shares_hash {
+                self.torrent_mgr.destroy_engine(&item.hash);
+            }
+
             let dl_dir = PathBuf::from(&item.download_dir);
-            if other_shares_hash {
-                if let Some(ref fname) = item.file_name {
-                    let fpath = dl_dir.join(fname);
-                    let _ = std::fs::remove_file(fpath);
-                }
-                for sub in &item.subtitles {
-                    let _ = std::fs::remove_file(&sub.path);
-                }
-            } else {
-                // Retry deletion up to 5 times in background if Windows holds a transient file lock
-                tokio::spawn(async move {
+            let file_name = item.file_name.clone();
+            let subtitles = item.subtitles.clone();
+
+            let cleanup_task = move || {
+                if other_shares_hash {
+                    if let Some(fname) = file_name {
+                        let _ = std::fs::remove_file(dl_dir.join(fname));
+                    }
+                    for sub in subtitles {
+                        let _ = std::fs::remove_file(&sub.path);
+                    }
+                } else {
                     for attempt in 1..=5 {
                         if !dl_dir.exists() || std::fs::remove_dir_all(&dl_dir).is_ok() {
                             info!(
@@ -902,14 +1058,18 @@ impl DownloadsManager {
                             );
                             break;
                         }
-                        tokio::time::sleep(Duration::from_secs(attempt)).await;
+                        std::thread::sleep(Duration::from_secs(attempt));
                     }
-                });
+                }
+            };
+
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                handle.spawn_blocking(cleanup_task);
+            } else {
+                cleanup_task();
             }
         }
 
-        self.save_downloads_meta();
-        self.broadcast_download_events();
         (hash_ret, download_id)
     }
 
@@ -1005,6 +1165,23 @@ impl DownloadsManager {
         updated
     }
 
+    /// Returns all torrent hashes belonging to active or completed downloads (so cache cleanup/stream switching preserves them)
+    pub fn protected_download_hashes(&self) -> HashSet<String> {
+        let mut hashes: HashSet<String> = self
+            .active_downloads
+            .read()
+            .values()
+            .map(|dl| dl.meta.hash.clone())
+            .collect();
+        let db_guard = self.db.read();
+        for item in db_guard.downloads.values() {
+            if item.status == "completed" {
+                hashes.insert(item.hash.clone());
+            }
+        }
+        hashes
+    }
+
     /// Pauses competing streams and background downloads when user starts watching `target_hash`
     pub fn pause_competing_streams_and_downloads(
         &self,
@@ -1016,12 +1193,7 @@ impl DownloadsManager {
             handle.abort();
         }
 
-        let shared_hashes: HashSet<String> = self
-            .active_downloads
-            .read()
-            .values()
-            .map(|dl| dl.meta.hash.clone())
-            .collect();
+        let shared_hashes = self.protected_download_hashes();
 
         self.torrent_mgr
             .stop_competing_streams(&clean_target, &shared_hashes);
@@ -1199,6 +1371,44 @@ impl DownloadsManager {
                 false,
             );
         }
+
+        self.seed_completed_downloads();
+    }
+
+    /// Re-announces completed downloads to the P2P swarm so they continue seeding after restart
+    pub fn seed_completed_downloads(self: &Arc<Self>) {
+        let completed_items: Vec<DownloadItemMeta> = {
+            let db_guard = self.db.read();
+            db_guard
+                .downloads
+                .values()
+                .filter(|d| d.status == "completed")
+                .cloned()
+                .collect()
+        };
+
+        if completed_items.is_empty() {
+            return;
+        }
+
+        info!(
+            "[Seeding] Re-announcing {} completed downloads to P2P network...",
+            completed_items.len()
+        );
+
+        let mgr = Arc::clone(&self.torrent_mgr);
+        tokio::spawn(async move {
+            for item in completed_items {
+                let dl_dir = PathBuf::from(&item.download_dir);
+                if find_exact_video_file(&dl_dir, item.file_name.as_deref()).is_none() {
+                    continue;
+                }
+                let season = if item.season > 0 { Some(item.season) } else { None };
+                let episode = if item.episode > 0 { Some(item.episode) } else { None };
+                mgr.start_or_get_engine(&item.hash, item.file_idx, season, episode, Some(dl_dir))
+                    .await;
+            }
+        });
     }
 
     pub fn find_completed_video_path(&self, id_or_hash: &str) -> Option<(DownloadItemMeta, PathBuf)> {

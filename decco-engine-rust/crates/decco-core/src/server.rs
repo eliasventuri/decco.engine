@@ -16,7 +16,7 @@ use axum::{
         sse::{Event, KeepAlive, Sse},
         IntoResponse, Response,
     },
-    routing::{any, get},
+    routing::get,
     Json, Router,
 };
 use serde::Deserialize;
@@ -29,7 +29,8 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::fs::File;
-use tokio::io::{AsyncReadExt, AsyncSeekExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeek, AsyncSeekExt};
+use tokio::sync::watch;
 use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::StreamExt as _;
 use tokio_util::io::ReaderStream;
@@ -40,6 +41,9 @@ pub struct AppState {
     pub torrent_mgr: Arc<TorrentEngineManager>,
     pub downloads_mgr: Arc<DownloadsManager>,
     pub cache_mgr: Arc<CacheManager>,
+    pub shutdown: watch::Sender<bool>,
+    pub auth_token: Option<String>,
+    pub http_client: reqwest::Client,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -56,9 +60,10 @@ pub struct StartDownloadQuery {
     pub hash: Option<String>,
     pub title: Option<String>,
     pub imdb_id: Option<String>,
+    pub poster: Option<String>,
     pub season: Option<u32>,
     pub episode: Option<u32>,
-    pub file_idx: Option<usize>,
+    pub file_idx: Option<isize>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -66,6 +71,13 @@ pub struct StartDownloadQuery {
 pub struct SettingsQuery {
     pub max_concurrent: Option<usize>,
     pub auto_pause_on_playback: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct SettingsBody {
+    pub max_concurrent: Option<usize>,
+    pub auto_pause_on_playback: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -138,13 +150,32 @@ async fn cors_and_loopback_middleware(
     resp
 }
 
+async fn auth_middleware(
+    State(state): State<AppState>,
+    req: Request,
+    next: Next,
+) -> Response {
+    if let Some(expected) = state.auth_token {
+        let valid = req
+            .headers()
+            .get("authorization")
+            .and_then(|value| value.to_str().ok())
+            .map(|value| value == format!("Bearer {expected}"))
+            .unwrap_or(false);
+        if !valid && req.method() != Method::OPTIONS {
+            return (StatusCode::UNAUTHORIZED, "Unauthorized").into_response();
+        }
+    }
+    next.run(req).await
+}
+
 pub fn build_router(state: AppState) -> Router {
     Router::new()
         .route("/ping", get(handle_ping))
         .route("/status/check", get(handle_status_check))
         .route("/prewarm/:hash", get(handle_prewarm))
         .route("/start/:hash", get(handle_start))
-        .route("/pause/:hash", get(handle_pause))
+        .route("/pause/:hash", get(handle_pause).post(handle_pause))
         .route("/stop/:hash", get(handle_stop).post(handle_stop))
         .route("/status/:hash", get(handle_status))
         .route("/proxy/:hash", get(handle_proxy))
@@ -155,7 +186,10 @@ pub fn build_router(state: AppState) -> Router {
                 .delete(handle_cache_clear),
         )
         .route("/cache", get(handle_cache_clear).delete(handle_cache_clear))
-        .route("/network/metered", get(handle_network_metered))
+        .route(
+            "/network/metered",
+            get(handle_network_metered).post(handle_network_metered),
+        )
         .route("/hls/:hash/:file", get(handle_hls_route))
         .route("/subtitles/:hash", get(handle_list_subtitles))
         .route(
@@ -163,26 +197,53 @@ pub fn build_router(state: AppState) -> Router {
             get(handle_extract_subtitle),
         )
         .route("/live/proxy", get(handle_live_proxy_route))
-        .route("/download/start", get(handle_download_start))
+        .route(
+            "/download/start",
+            get(handle_download_start).post(handle_download_start),
+        )
         .route("/download/list", get(handle_download_list))
         .route("/download/events", get(handle_download_events))
-        .route("/download/pause/:id", get(handle_download_pause))
-        .route("/download/resume/:id", get(handle_download_resume))
-        .route("/download/delete/:id", get(handle_download_delete))
+        .route(
+            "/download/pause/:id",
+            get(handle_download_pause).post(handle_download_pause),
+        )
+        .route(
+            "/download/resume/:id",
+            get(handle_download_resume).post(handle_download_resume),
+        )
+        .route(
+            "/download/delete/:id",
+            get(handle_download_delete)
+                .post(handle_download_delete)
+                .delete(handle_download_delete),
+        )
         .route("/download/open/:id", get(handle_download_open))
         .route("/download/force-start/:id", get(handle_download_force_start))
-        .route("/download/pause-all", get(handle_download_pause_all))
-        .route("/download/resume-all", get(handle_download_resume_all))
+        .route(
+            "/download/pause-all",
+            get(handle_download_pause_all).post(handle_download_pause_all),
+        )
+        .route(
+            "/download/resume-all",
+            get(handle_download_resume_all).post(handle_download_resume_all),
+        )
         .route(
             "/download/clear-completed",
-            get(handle_download_clear_completed),
+            get(handle_download_clear_completed).post(handle_download_clear_completed),
         )
         .route("/download/settings", get(handle_download_settings))
-        .route("/download/settings/set", any(handle_download_settings_set))
+        .route(
+            "/download/settings/set",
+            get(handle_download_settings_set).post(handle_download_settings_set),
+        )
         .route(
             "/download/subtitle/:hash/:lang",
             get(handle_download_subtitle),
         )
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth_middleware,
+        ))
         .layer(middleware::from_fn(cors_and_loopback_middleware))
         .with_state(state)
 }
@@ -230,19 +291,6 @@ async fn handle_prewarm(
     tokio::spawn(async move {
         let _ = prefetch_torrent_cache_file(&hash_bg, &cache_dir).await;
     });
-
-    if !state
-        .torrent_mgr
-        .active_engines
-        .read()
-        .contains_key(&clean_hash)
-    {
-        let mgr = Arc::clone(&state.torrent_mgr);
-        let h = clean_hash.clone();
-        tokio::spawn(async move {
-            mgr.start_or_get_engine(&h, None, None, None, None).await;
-        });
-    }
 
     (
         StatusCode::OK,
@@ -328,7 +376,8 @@ async fn handle_status(
 }
 
 async fn handle_cache_clear(State(state): State<AppState>) -> impl IntoResponse {
-    state.torrent_mgr.active_engines.write().clear();
+    let protected = state.downloads_mgr.protected_download_hashes();
+    state.torrent_mgr.destroy_engines_except(&protected);
     match state.cache_mgr.clear_all_streaming_cache() {
         Ok(()) => (
             StatusCode::OK,
@@ -387,22 +436,16 @@ fn parse_range_header(range_header: &str, file_size: u64) -> Option<(u64, u64)> 
     Some((start, end))
 }
 
-/// Serves a local file with full HTTP 206 Partial Content / Range support
-async fn serve_file_with_range(
-    file_path: &Path,
-     declared_size: Option<u64>,
+/// Serves any `AsyncRead + AsyncSeek` stream with full HTTP 206 Partial Content / Range support
+async fn serve_reader_with_range<R>(
+    mut reader: R,
+    file_size: u64,
+    content_type: &'static str,
     headers: &HeaderMap,
-) -> Response {
-    let mut file = match File::open(file_path).await {
-        Ok(f) => f,
-        Err(_) => return (StatusCode::NOT_FOUND, "File not found").into_response(),
-    };
-
-    let disk_size = match file.metadata().await {
-        Ok(m) => m.len(),
-        Err(_) => return (StatusCode::NOT_FOUND, "Metadata unavailable").into_response(),
-    };
-    let file_size = declared_size.unwrap_or(disk_size).max(disk_size);
+) -> Response
+where
+    R: AsyncRead + AsyncSeek + Unpin + Send + 'static,
+{
     if file_size == 0 {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -410,12 +453,6 @@ async fn serve_file_with_range(
         )
             .into_response();
     }
-
-    let file_name = file_path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("video.mp4");
-    let content_type = get_video_content_type(file_name);
 
     let range_header = headers.get("range").and_then(|v| v.to_str().ok());
 
@@ -428,12 +465,12 @@ async fn serve_file_with_range(
                 .unwrap();
         };
 
-        if file.seek(SeekFrom::Start(start)).await.is_err() {
+        if reader.seek(SeekFrom::Start(start)).await.is_err() {
             return (StatusCode::INTERNAL_SERVER_ERROR, "Seek error").into_response();
         }
 
         let chunk_size = (end - start) + 1;
-        let limited = file.take(chunk_size);
+        let limited = reader.take(chunk_size);
         let stream = ReaderStream::with_capacity(limited, 64 * 1024);
 
         Response::builder()
@@ -445,7 +482,7 @@ async fn serve_file_with_range(
             .body(Body::from_stream(stream))
             .unwrap()
     } else {
-        let stream = ReaderStream::with_capacity(file, 64 * 1024);
+        let stream = ReaderStream::with_capacity(reader, 64 * 1024);
         Response::builder()
             .status(StatusCode::OK)
             .header("Content-Length", file_size.to_string())
@@ -454,6 +491,32 @@ async fn serve_file_with_range(
             .body(Body::from_stream(stream))
             .unwrap()
     }
+}
+
+/// Serves a local file with full HTTP 206 Partial Content / Range support
+async fn serve_file_with_range(
+    file_path: &Path,
+    declared_size: Option<u64>,
+    headers: &HeaderMap,
+) -> Response {
+    let file = match File::open(file_path).await {
+        Ok(f) => f,
+        Err(_) => return (StatusCode::NOT_FOUND, "File not found").into_response(),
+    };
+
+    let disk_size = match file.metadata().await {
+        Ok(m) => m.len(),
+        Err(_) => return (StatusCode::NOT_FOUND, "Metadata unavailable").into_response(),
+    };
+    let file_size = declared_size.unwrap_or(disk_size).max(disk_size);
+
+    let file_name = file_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("video.mp4");
+    let content_type = get_video_content_type(file_name);
+
+    serve_reader_with_range(file, file_size, content_type, headers).await
 }
 
 async fn handle_proxy(
@@ -515,6 +578,12 @@ async fn handle_proxy(
     state
         .torrent_mgr
         .on_proxy_range_request(&clean_hash, start_byte);
+
+    #[cfg(feature = "rqbit-backend")]
+    if let Some(torrent_stream) = state.torrent_mgr.open_stream_for_hash(&clean_hash) {
+        let content_type = get_video_content_type(&vf.name);
+        return serve_reader_with_range(torrent_stream, vf.length, content_type, &headers).await;
+    }
 
     serve_file_with_range(&vf.path, Some(vf.length), &headers).await
 }
@@ -719,7 +788,7 @@ async fn handle_live_proxy_route(
     headers: HeaderMap,
 ) -> Response {
     let port = *state.torrent_mgr.primary_port.read();
-    handle_live_proxy(query, headers, port).await
+    handle_live_proxy(query, headers, port, &state.http_client).await
 }
 
 async fn handle_download_start(
@@ -736,16 +805,18 @@ async fn handle_download_start(
 
     let title = query.title.unwrap_or_else(|| "Video".to_string());
     let imdb_id = query.imdb_id.unwrap_or_default();
+    let poster = query.poster.unwrap_or_default();
     let season = query.season.unwrap_or(0);
     let episode = query.episode.unwrap_or(0);
 
-    let meta = state.downloads_mgr.start_download(
+    let meta = state.downloads_mgr.start_download_with_poster(
         hash,
         &title,
         &imdb_id,
+        &poster,
         season,
         episode,
-        query.file_idx,
+        query.file_idx.and_then(|idx| usize::try_from(idx).ok()),
         false,
     );
 
@@ -882,12 +953,14 @@ async fn handle_download_open(
     #[cfg(target_os = "windows")]
     {
         if target_to_open.is_file() {
+            // Pass `/select,` as a separate arg so Rust's Windows arg quoting doesn't wrap `/select,` inside quotes.
             let _ = std::process::Command::new("explorer.exe")
-                .arg(format!("/select,{}", target_to_open.display()))
-                .spawn();
-        } else {
-            let _ = std::process::Command::new("explorer.exe")
+                .arg("/select,")
                 .arg(target_to_open.as_os_str())
+                .spawn();
+        } else if dl_dir.exists() {
+            let _ = std::process::Command::new("explorer.exe")
+                .arg(dl_dir.as_os_str())
                 .spawn();
         }
     }
@@ -927,13 +1000,32 @@ async fn handle_download_settings(State(state): State<AppState>) -> impl IntoRes
 async fn handle_download_settings_set(
     State(state): State<AppState>,
     Query(query): Query<SettingsQuery>,
+    body: Option<Json<SettingsBody>>,
 ) -> impl IntoResponse {
-    let auto_pause = query.auto_pause_on_playback.as_deref().map(|v| {
-        v.eq_ignore_ascii_case("true") || v == "1"
-    });
+    let body_val = body.map(|Json(b)| b);
+    let max_concurrent = query
+        .max_concurrent
+        .or_else(|| body_val.as_ref().and_then(|b| b.max_concurrent));
+    let auto_pause = query
+        .auto_pause_on_playback
+        .as_deref()
+        .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
+        .or_else(|| {
+            body_val
+                .as_ref()
+                .and_then(|b| b.auto_pause_on_playback.as_ref())
+                .and_then(|v| match v {
+                    serde_json::Value::Bool(b) => Some(*b),
+                    serde_json::Value::Number(n) => Some(n.as_i64() == Some(1)),
+                    serde_json::Value::String(s) => {
+                        Some(s.eq_ignore_ascii_case("true") || s == "1")
+                    }
+                    _ => None,
+                })
+        });
     let updated = state
         .downloads_mgr
-        .update_settings(query.max_concurrent, auto_pause);
+        .update_settings(max_concurrent, auto_pause);
     Json(json!({
         "status": "ok",
         "settings": updated
@@ -983,7 +1075,8 @@ async fn handle_download_subtitle(
 }
 
 /// Starts the multi-port HTTP server (`[18889, 18888, 28888, 38888, 48888, 8888]`)
-/// binding primarily to `127.0.0.1` (Firewall-safe) with fallback to `[::]` and `0.0.0.0`.
+/// binding exclusively to `127.0.0.1` so the local control API is never exposed
+/// to the LAN when the preferred port is unavailable.
 /// Also launches the 72h cache cleanup loop and restores active downloads.
 pub async fn start_multiport_server(state: AppState) -> anyhow::Result<Vec<u16>> {
     let ports = state.torrent_mgr.config.ports.clone();
@@ -1003,11 +1096,10 @@ pub async fn start_multiport_server(state: AppState) -> anyhow::Result<Vec<u16>>
             }
             Err(e) => {
                 warn!(
-                    "[Server] Failed to bind to 127.0.0.1:{}: {}. Trying fallback...",
+                    "[Server] Failed to bind to 127.0.0.1:{}: {}",
                     port, e
                 );
-                let addr_v4_any: SocketAddr = ([0, 0, 0, 0], port).into();
-                tokio::net::TcpListener::bind(addr_v4_any).await.ok()
+                None
             }
         };
 
@@ -1018,13 +1110,16 @@ pub async fn start_multiport_server(state: AppState) -> anyhow::Result<Vec<u16>>
                 info!("[Server] Primary engine port is now: {}", port);
             }
 
+            let mut shutdown = state.shutdown.subscribe();
             tokio::spawn(async move {
-                if let Err(err) = axum::serve(
+                let server = axum::serve(
                     tcp_listener,
                     router.into_make_service_with_connect_info::<SocketAddr>(),
                 )
-                .await
-                {
+                .with_graceful_shutdown(async move {
+                    let _ = shutdown.changed().await;
+                });
+                if let Err(err) = server.await {
                     error!("[Server] Error on port {}: {}", port, err);
                 }
             });
@@ -1034,11 +1129,18 @@ pub async fn start_multiport_server(state: AppState) -> anyhow::Result<Vec<u16>>
     // Background startup tasks (restore downloads + hourly 72h cache cleanup)
     let state_bg = state.clone();
     tokio::spawn(async move {
+        let mut shutdown = state_bg.shutdown.subscribe();
         tokio::time::sleep(Duration::from_secs(3)).await;
+        if *shutdown.borrow() {
+            return;
+        }
         state_bg.downloads_mgr.restore_downloads();
 
         // Run cache cleanup on startup and then every hour
         loop {
+            if *shutdown.borrow() {
+                break;
+            }
             let expired = state_bg.cache_mgr.collect_expired_hashes();
             for hash in expired {
                 state_bg.torrent_mgr.destroy_engine(&hash);
@@ -1052,10 +1154,157 @@ pub async fn start_multiport_server(state: AppState) -> anyhow::Result<Vec<u16>>
                 .collect();
             state_bg.cache_mgr.clean_orphaned_files(&active_hashes);
 
-            tokio::time::sleep(Duration::from_secs(3600)).await;
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_secs(3600)) => {}
+                _ = shutdown.changed() => break,
+            }
         }
     });
 
     Ok(bound_ports)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::EngineConfig;
+    use crate::DeccoEngine;
+
+    #[test]
+    fn parse_range_header_handles_standard_and_edge_cases() {
+        assert_eq!(parse_range_header("bytes=0-99", 1000), Some((0, 99)));
+        assert_eq!(parse_range_header("bytes=100-", 1000), Some((100, 999)));
+        assert_eq!(parse_range_header("bytes=-200", 1000), Some((800, 999)));
+        assert_eq!(parse_range_header("bytes=-2000", 1000), Some((0, 999)));
+        assert_eq!(parse_range_header("bytes=0-5000", 1000), Some((0, 999)));
+        assert_eq!(parse_range_header("bytes=1000-", 1000), None);
+        assert_eq!(parse_range_header("bytes=500-100", 1000), None);
+        assert_eq!(parse_range_header("bytes=0-1,2-3", 1000), None);
+        assert_eq!(parse_range_header("bytes=0-0", 0), None);
+    }
+
+    async fn spawn_test_server(auth_token: Option<String>) -> (u16, DeccoEngine, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "decco_test_{}_{}",
+            std::process::id(),
+            crate::config::now_ms()
+        ));
+        let cfg = EngineConfig::new(dir.clone(), false);
+        let engine = match auth_token {
+            Some(t) => DeccoEngine::new_with_auth(cfg, t),
+            None => DeccoEngine::new(cfg),
+        };
+        let router = build_router(engine.state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        *engine.state.torrent_mgr.primary_port.write() = port;
+
+        let mut shutdown = engine.state.shutdown.subscribe();
+        tokio::spawn(async move {
+            let _ = axum::serve(
+                listener,
+                router.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .with_graceful_shutdown(async move {
+                let _ = shutdown.changed().await;
+            })
+            .await;
+        });
+
+        (port, engine, dir)
+    }
+
+    #[tokio::test]
+    async fn http_router_endpoints_and_cors_pna() {
+        let (port, engine, dir) = spawn_test_server(None).await;
+        let base = format!("http://127.0.0.1:{}", port);
+        let client = reqwest::Client::new();
+
+        // OPTIONS preflight with PNA
+        let opt = client
+            .request(reqwest::Method::OPTIONS, format!("{}/ping", base))
+            .header("Access-Control-Request-Private-Network", "true")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(opt.status(), 200);
+        assert_eq!(
+            opt.headers()
+                .get("access-control-allow-private-network")
+                .and_then(|v| v.to_str().ok()),
+            Some("true")
+        );
+
+        // GET /ping & /status/check
+        let ping: serde_json::Value = client
+            .get(format!("{}/ping", base))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(ping["pong"], true);
+        assert_eq!(ping["port"], port);
+
+        let sc: serde_json::Value = client
+            .get(format!("{}/status/check", base))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(sc["status"], "ok");
+
+        // POST /download/settings/set with JSON body
+        let set_resp: serde_json::Value = client
+            .post(format!("{}/download/settings/set", base))
+            .json(&json!({ "maxConcurrent": 4, "autoPauseOnPlayback": false }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(set_resp["settings"]["maxConcurrent"], 4);
+        assert_eq!(set_resp["settings"]["autoPauseOnPlayback"], false);
+
+        // GET /live/proxy validation
+        let bad_proto = client
+            .get(format!("{}/live/proxy?url=file:///etc/passwd", base))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(bad_proto.status(), 400);
+
+        engine.shutdown();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn http_router_enforces_bearer_auth_when_configured() {
+        let (port, engine, dir) = spawn_test_server(Some("secret-token".to_string())).await;
+        let base = format!("http://127.0.0.1:{}", port);
+        let client = reqwest::Client::new();
+
+        let unauth = client
+            .get(format!("{}/ping", base))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(unauth.status(), 401);
+
+        let auth = client
+            .get(format!("{}/ping", base))
+            .bearer_auth("secret-token")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(auth.status(), 200);
+
+        engine.shutdown();
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }
 

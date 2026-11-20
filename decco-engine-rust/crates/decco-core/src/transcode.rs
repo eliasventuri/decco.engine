@@ -27,13 +27,23 @@ pub struct ProbeResult {
 
 static HARDWARE_ENCODER: OnceCell<String> = OnceCell::new();
 
+fn hidden_command(program: &str) -> Command {
+    let mut cmd = Command::new(program);
+    #[cfg(windows)]
+    {
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    cmd
+}
+
 /// Detects the fastest available H.264 encoder (`h264_nvenc`, `h264_qsv`, `h264_amf`, or `libx264`)
 pub async fn detect_hardware_encoder() -> &'static str {
     if let Some(enc) = HARDWARE_ENCODER.get() {
         return enc.as_str();
     }
 
-    let detected = match Command::new("ffmpeg")
+    let detected = match hidden_command("ffmpeg")
         .args(["-hide_banner", "-encoders"])
         .output()
         .await
@@ -80,7 +90,7 @@ pub fn srt_to_webvtt(srt_content: &str) -> String {
 
 /// Probes duration, codecs, and embedded subtitle tracks via `ffprobe`
 pub async fn probe_media_url(target_url_or_path: &str) -> anyhow::Result<ProbeResult> {
-    let output = Command::new("ffprobe")
+    let output = hidden_command("ffprobe")
         .args([
             "-v",
             "quiet",
@@ -239,7 +249,7 @@ pub async fn spawn_hls_segment_transcoder(
         transcode_mode
     );
 
-    let mut cmd = Command::new("ffmpeg");
+    let mut cmd = hidden_command("ffmpeg");
     cmd.arg("-hide_banner").arg("-loglevel").arg("warning");
 
     // For segment 0 (start_time == 0), pass -seekable 0 so FFmpeg streams sequentially from byte 0
@@ -342,7 +352,7 @@ pub async fn spawn_hls_segment_transcoder(
 pub async fn spawn_subtitle_extractor(proxy_url: &str, track_index: usize) -> anyhow::Result<Child> {
     info!("[Subtitles] Extracting track {} from {}", track_index, proxy_url);
 
-    let mut cmd = Command::new("ffmpeg");
+    let mut cmd = hidden_command("ffmpeg");
     cmd.args([
         "-hide_banner",
         "-loglevel",
@@ -362,5 +372,29 @@ pub async fn spawn_subtitle_extractor(proxy_url: &str, track_index: usize) -> an
 
     let child = cmd.spawn()?;
     Ok(child)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn srt_to_webvtt_converts_timestamps() {
+        let srt = "1\r\n00:01:02,345 --> 00:01:05,678\r\nHello world\r\n";
+        let vtt = srt_to_webvtt(srt);
+        assert!(vtt.starts_with("WEBVTT\n\n"));
+        assert!(vtt.contains("00:01:02.345 --> 00:01:05.678"));
+        assert!(vtt.contains("Hello world"));
+    }
+
+    #[test]
+    fn build_hls_vod_manifest_generates_expected_segments() {
+        let m3u8 = build_hls_vod_manifest(35.0);
+        assert!(m3u8.contains("#EXTM3U"));
+        assert!(m3u8.contains("segment-0.ts"));
+        assert!(m3u8.contains("segment-2.ts"));
+        assert!(!m3u8.contains("segment-3.ts"));
+        assert!(m3u8.ends_with("#EXT-X-ENDLIST"));
+    }
 }
 

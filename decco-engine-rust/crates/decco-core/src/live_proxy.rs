@@ -8,7 +8,6 @@ use axum::{
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::time::Duration;
 use tracing::error;
 use url::Url;
 
@@ -154,6 +153,7 @@ pub async fn handle_live_proxy(
     Query(query): Query<LiveProxyQuery>,
     headers: HeaderMap,
     primary_port: u16,
+    client: &reqwest::Client,
 ) -> Response {
     let target = match query.url {
         Some(ref u) if !u.trim().is_empty() => u.trim().to_string(),
@@ -195,21 +195,6 @@ pub async fn handle_live_proxy(
     let mut forward_opts = ForwardOpts {
         referrer: query.referrer.clone().filter(|s| !s.is_empty()),
         user_agent: query.ua.clone().filter(|s| !s.is_empty()),
-    };
-
-    let client = match reqwest::Client::builder()
-        .timeout(Duration::from_secs(12))
-        .redirect(reqwest::redirect::Policy::limited(10))
-        .build()
-    {
-        Ok(c) => c,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "error": e.to_string() })),
-            )
-                .into_response()
-        }
     };
 
     let ua = forward_opts
@@ -262,16 +247,16 @@ pub async fn handle_live_proxy(
         req
     };
 
-    let initial_method = if should_probe {
-        reqwest::Method::HEAD
+    let initial_range = if should_probe {
+        Some("bytes=0-511")
     } else {
-        reqwest::Method::GET
+        None
     };
 
     let mut upstream = match build_req(
-        initial_method.clone(),
+        reqwest::Method::GET,
         forward_opts.referrer.as_deref(),
-        None,
+        initial_range,
     )
     .send()
     .await
@@ -294,7 +279,7 @@ pub async fn handle_live_proxy(
     {
         let origin_str = parsed.origin().ascii_serialization();
         let spoof_ref = format!("{}/", origin_str);
-        if let Ok(retry_res) = build_req(initial_method, Some(&spoof_ref), None)
+        if let Ok(retry_res) = build_req(reqwest::Method::GET, Some(&spoof_ref), initial_range)
             .send()
             .await
         {
@@ -305,15 +290,15 @@ pub async fn handle_live_proxy(
         }
     }
 
-    // Probe fallback from HEAD to GET Range: bytes=0-511 on 403/405
+    // Probe fallback: if server rejects Range (416) or returns 405, retry plain GET without Range
     if should_probe
-        && (upstream.status() == reqwest::StatusCode::FORBIDDEN
+        && (upstream.status() == reqwest::StatusCode::RANGE_NOT_SATISFIABLE
             || upstream.status() == reqwest::StatusCode::METHOD_NOT_ALLOWED)
     {
         if let Ok(retry_res) = build_req(
             reqwest::Method::GET,
             forward_opts.referrer.as_deref(),
-            Some("bytes=0-511"),
+            None,
         )
         .send()
         .await
@@ -418,6 +403,8 @@ pub async fn handle_live_proxy(
             && !effective_pathname.ends_with(".m4s"));
 
     if might_be_text_manifest {
+        let upstream_status =
+            StatusCode::from_u16(upstream.status().as_u16()).unwrap_or(StatusCode::OK);
         return match upstream.bytes().await {
             Ok(bytes) => {
                 let text = String::from_utf8_lossy(&bytes);
@@ -456,7 +443,7 @@ pub async fn handle_live_proxy(
                 }
 
                 let mut resp = Response::new(Body::from(bytes));
-                *resp.status_mut() = StatusCode::OK;
+                *resp.status_mut() = upstream_status;
                 if !content_type.is_empty() {
                     if let Ok(val) = content_type.parse() {
                         resp.headers_mut().insert("Content-Type", val);
@@ -497,5 +484,32 @@ pub async fn handle_live_proxy(
     response_builder.body(body).unwrap_or_else(|_| {
         (StatusCode::BAD_GATEWAY, "Failed to stream upstream body").into_response()
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rewrite_live_manifest_absolutizes_and_proxies_segments_and_keys() {
+        let m3u8 = "#EXTM3U\n#EXT-X-KEY:METHOD=AES-128,URI=\"keys/k.key\"\n#EXTINF:6.0,\nseg0.ts\n";
+        let opts = ForwardOpts {
+            referrer: Some("https://player.example/".to_string()),
+            user_agent: None,
+        };
+        let out = rewrite_live_manifest(m3u8, "https://cdn.example/live/index.m3u8", "127.0.0.1:18889", &opts);
+        assert!(out.contains("http://127.0.0.1:18889/live/proxy?url=https%3A%2F%2Fcdn.example%2Flive%2Fkeys%2Fk.key"));
+        assert!(out.contains("http://127.0.0.1:18889/live/proxy?url=https%3A%2F%2Fcdn.example%2Flive%2Fseg0.ts"));
+        assert!(out.contains("ref=https%3A%2F%2Fplayer.example%2F"));
+    }
+
+    #[test]
+    fn rewrite_live_dash_manifest_proxies_base_url_and_attributes() {
+        let mpd = "<MPD><BaseURL>media/</BaseURL><SegmentTemplate initialization=\"init.mp4\" media=\"seg-$Number$.m4s\"/></MPD>";
+        let opts = ForwardOpts { referrer: None, user_agent: None };
+        let out = rewrite_live_dash_manifest(mpd, "https://cdn.example/dash/manifest.mpd", "127.0.0.1:18889", &opts);
+        assert!(out.contains("<BaseURL>http://127.0.0.1:18889/live/proxy?url=https%3A%2F%2Fcdn.example%2Fdash%2Fmedia%2F</BaseURL>"));
+        assert!(out.contains("initialization=\"http://127.0.0.1:18889/live/proxy?url=https%3A%2F%2Fcdn.example%2Fdash%2Finit.mp4\""));
+    }
 }
 

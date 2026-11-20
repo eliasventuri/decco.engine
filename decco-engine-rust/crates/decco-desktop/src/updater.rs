@@ -100,32 +100,53 @@ impl UpdaterState {
         };
         let remote_version = tag_name.trim_start_matches('v');
 
-        if remote_version == self.current_version {
-            info!("[Updater] Update not available (up to date: v{}).", self.current_version);
+        if !is_newer_version(remote_version, &self.current_version) {
+            info!(
+                "[Updater] Update not available (current: v{}, remote: v{}).",
+                self.current_version, remote_version
+            );
             return;
         }
 
         info!("[Updater] Update available: {}", remote_version);
 
-        // Find Windows installer asset (.exe)
+        // Find Windows installer asset (.exe), preferring decco-engine / Setup naming
         if let Some(assets) = release_json.get("assets").and_then(|a| a.as_array()) {
-            for asset in assets {
-                let name = asset.get("name").and_then(|n| n.as_str()).unwrap_or("");
-                let dl_url = asset
-                    .get("browser_download_url")
-                    .and_then(|u| u.as_str())
-                    .unwrap_or("");
-
-                if name.ends_with(".exe") && !dl_url.is_empty() {
-                    if let Some(parent) = self.info_path.parent() {
-                        let dest = parent.join(format!("decco-engine-setup-{}.exe", remote_version));
-                        if Self::download_asset(&client, dl_url, &dest).await.is_ok() {
-                            *self.downloaded_installer.write() = Some(dest);
-                            *self.update_ready.write() = true;
-                            info!("[Updater] Update downloaded. Ready to install.");
-                        }
+            let selected = assets
+                .iter()
+                .filter_map(|asset| {
+                    let name = asset.get("name").and_then(|n| n.as_str()).unwrap_or("");
+                    let dl_url = asset
+                        .get("browser_download_url")
+                        .and_then(|u| u.as_str())
+                        .unwrap_or("");
+                    if name.to_ascii_lowercase().ends_with(".exe") && !dl_url.is_empty() {
+                        Some((name, dl_url))
+                    } else {
+                        None
                     }
-                    break;
+                })
+                .max_by_key(|(name, _)| {
+                    let lower = name.to_ascii_lowercase();
+                    let mut score = 0u8;
+                    if lower.contains("decco-engine") {
+                        score += 2;
+                    }
+                    if lower.contains("setup") {
+                        score += 1;
+                    }
+                    score
+                });
+
+            if let Some((_, dl_url)) = selected {
+                if let Some(parent) = self.info_path.parent() {
+                    let dest = parent.join(format!("decco-engine-setup-{}.exe", remote_version));
+                    if Self::download_asset(&client, dl_url, &dest).await.is_ok() {
+                        *self.downloaded_installer.write() = Some(dest);
+                        *self.update_ready.write() = true;
+                        info!("[Updater] Update downloaded. Forcing silent installation immediately.");
+                        self.quit_and_install();
+                    }
                 }
             }
         }
@@ -168,6 +189,44 @@ impl UpdaterState {
                 self.check_for_updates().await;
             }
         });
+    }
+}
+
+/// Returns `true` iff `remote` is strictly newer than `current` using numeric `major.minor.patch` comparison.
+pub fn is_newer_version(remote: &str, current: &str) -> bool {
+    let parse = |v: &str| -> Vec<u64> {
+        v.trim()
+            .trim_start_matches('v')
+            .split(['.', '-', '+'])
+            .take(3)
+            .filter_map(|p| p.parse::<u64>().ok())
+            .collect()
+    };
+    let r = parse(remote);
+    let c = parse(current);
+    let max_len = r.len().max(c.len());
+    for i in 0..max_len {
+        let rv = r.get(i).copied().unwrap_or(0);
+        let cv = c.get(i).copied().unwrap_or(0);
+        if rv != cv {
+            return rv > cv;
+        }
+    }
+    false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn is_newer_version_compares_semver_numerically() {
+        assert!(is_newer_version("1.1.83", "1.1.82"));
+        assert!(is_newer_version("1.2.0", "1.1.99"));
+        assert!(is_newer_version("v2.0.0", "1.9.9"));
+        assert!(!is_newer_version("1.1.82", "1.1.82"));
+        assert!(!is_newer_version("1.1.81", "1.1.82"));
+        assert!(!is_newer_version("1.0.99", "1.1.0"));
     }
 }
 
