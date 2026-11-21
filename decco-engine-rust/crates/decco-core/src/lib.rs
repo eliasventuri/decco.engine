@@ -64,6 +64,15 @@ impl DeccoEngine {
             let _ = crate::transcode::detect_hardware_encoder().await;
         });
 
+        // Pre-warm BitTorrent session & DHT routing table in background so first play starts instantly
+        #[cfg(feature = "rqbit-backend")]
+        {
+            let mgr = Arc::clone(&self.state.torrent_mgr);
+            tokio::spawn(async move {
+                let _ = mgr.get_or_init_session().await;
+            });
+        }
+
         start_multiport_server(self.state.clone()).await
     }
 

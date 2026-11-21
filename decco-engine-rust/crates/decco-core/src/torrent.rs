@@ -1,7 +1,7 @@
 use crate::cache::CacheManager;
 use crate::config::{
     build_episode_pattern, build_magnet_uri, find_exact_video_file, is_video_file, EngineConfig,
-    READAHEAD_WINDOW_BYTES,
+    READAHEAD_WINDOW_BYTES, TRACKERS,
 };
 use crate::transcode::{probe_media_url, EmbeddedSubtitle};
 use parking_lot::RwLock;
@@ -102,30 +102,42 @@ pub async fn prefetch_torrent_cache_file(hash: &str, target_dir: &Path) -> Optio
     ];
 
     let client = reqwest::Client::builder()
-        .timeout(Duration::from_millis(2200))
+        .timeout(Duration::from_millis(1200))
         .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
         .redirect(reqwest::redirect::Policy::limited(5))
         .build()
         .ok()?;
 
-    for url in &urls {
-        if let Ok(res) = client.get(url).send().await {
+    // Race all HTTP .torrent caches in parallel so we never block sequentially
+    let mut set = tokio::task::JoinSet::new();
+    for url in urls {
+        let c = client.clone();
+        set.spawn(async move {
+            let res = c.get(&url).send().await.ok()?;
             if !res.status().is_success() {
-                continue;
+                return None;
             }
-            if let Ok(bytes) = res.bytes().await {
-                // Valid bencoded .torrent starts with 'd' (0x64)
-                if bytes.len() > 64 && bytes[0] == 0x64 {
-                    let _ = std::fs::create_dir_all(&cache_torrent_dir);
-                    if std::fs::write(&cache_torrent_path, &bytes).is_ok() {
-                        info!(
-                            "[Engine] Fast-resolved .torrent metadata via HTTP cache ({} bytes) for {}",
-                            bytes.len(),
-                            clean_hash
-                        );
-                        return Some(cache_torrent_path);
-                    }
-                }
+            let bytes = res.bytes().await.ok()?;
+            // Valid bencoded .torrent starts with 'd' (0x64)
+            if bytes.len() > 64 && bytes[0] == 0x64 {
+                Some(bytes)
+            } else {
+                None
+            }
+        });
+    }
+
+    while let Some(res) = set.join_next().await {
+        if let Ok(Some(bytes)) = res {
+            let _ = std::fs::create_dir_all(&cache_torrent_dir);
+            if std::fs::write(&cache_torrent_path, &bytes).is_ok() {
+                info!(
+                    "[Engine] Fast-resolved .torrent metadata via HTTP cache ({} bytes) for {}",
+                    bytes.len(),
+                    clean_hash
+                );
+                set.abort_all();
+                return Some(cache_torrent_path);
             }
         }
     }
@@ -246,6 +258,11 @@ impl TorrentEngineManager {
                 opts.persistence = None;
                 opts.listen_port_range = Some(4240..4260);
                 opts.enable_upnp_port_forwarding = true;
+                opts.peer_opts = Some(librqbit::PeerConnectionOptions {
+                    connect_timeout: Some(Duration::from_secs(4)),
+                    read_write_timeout: Some(Duration::from_secs(10)),
+                    ..Default::default()
+                });
                 let session = librqbit::Session::new_with_opts(dir, opts).await?;
                 Ok(session)
             })
@@ -403,6 +420,19 @@ impl TorrentEngineManager {
         self.cancel_stop_grace_timeout(&clean_hash);
         *self.active_streaming_hash.write() = Some(clean_hash.clone());
 
+        // Pause competing active streaming torrents so 100% of bandwidth/sockets go to this playback
+        let other_hashes: Vec<String> = {
+            let guard = self.active_engines.read();
+            guard
+                .iter()
+                .filter(|(h, eng)| *h != &clean_hash && !eng.is_mock && eng.status != "paused")
+                .map(|(h, _)| h.clone())
+                .collect()
+        };
+        for other_h in other_hashes {
+            self.pause_engine(&other_h);
+        }
+
         // Check if already active and update episode selection if needed
         {
             let mut guard = self.active_engines.write();
@@ -538,25 +568,24 @@ impl TorrentEngineManager {
             #[cfg(feature = "rqbit-backend")]
             {
                 if let Ok(session) = mgr.get_or_init_session().await {
-                    let add_target = if let Some(ref path) = cached_torrent {
-                        if let Ok(bytes) = std::fs::read(path) {
-                            librqbit::AddTorrent::from_bytes(bytes)
-                        } else {
-                            librqbit::AddTorrent::from_url(build_magnet_uri(&hash_for_task))
-                        }
-                    } else {
-                        librqbit::AddTorrent::from_url(build_magnet_uri(&hash_for_task))
-                    };
+                    let default_trackers: Vec<String> =
+                        TRACKERS.iter().map(|s| s.to_string()).collect();
 
-                    // Step 1: Resolve metadata with `list_only: true` so librqbit never preallocates
-                    // unwanted files in multi-file / season-pack torrents before file selection.
-                    let mut list_opts = librqbit::AddTorrentOptions::default();
-                    list_opts.list_only = true;
-                    list_opts.output_folder =
-                        Some(save_dir_for_task.to_string_lossy().to_string());
+                    // Only use `list_only` when we already have local `.torrent` bytes (0ms in-memory parse).
+                    // For magnets, add directly ONCE with all trackers so we never drop connected peers!
+                    let (final_target, only_files_vec) = if let Some(bytes) = cached_torrent
+                        .as_ref()
+                        .and_then(|path| std::fs::read(path).ok())
+                    {
+                        let mut list_opts = librqbit::AddTorrentOptions::default();
+                        list_opts.list_only = true;
+                        list_opts.output_folder =
+                            Some(save_dir_for_task.to_string_lossy().to_string());
 
-                    let (final_target, only_files_vec) =
-                        match session.add_torrent(add_target, Some(list_opts)).await {
+                        match session
+                            .add_torrent(librqbit::AddTorrent::from_bytes(bytes.clone()), Some(list_opts))
+                            .await
+                        {
                             Ok(librqbit::AddTorrentResponse::ListOnly(list_res)) => {
                                 let mut preview_files = Vec::new();
                                 let mut offset = 0u64;
@@ -591,31 +620,22 @@ impl TorrentEngineManager {
                                     only,
                                 )
                             }
-                            Ok(other) => {
-                                if let Some(h) = other.into_handle() {
-                                    let _ = session
-                                        .delete(librqbit::api::TorrentIdOrHash::Id(h.id()), false)
-                                        .await;
-                                }
-                                (
-                                    librqbit::AddTorrent::from_url(build_magnet_uri(&hash_for_task)),
-                                    file_idx.map(|i| vec![i]),
-                                )
-                            }
-                            Err(e) => {
-                                error!("[Engine] Error resolving metadata for {}: {}", hash_for_task, e);
-                                let mut guard = mgr.active_engines.write();
-                                if let Some(eng) = guard.get_mut(&hash_for_task) {
-                                    eng.status = "error".to_string();
-                                    eng.error = Some(e.to_string());
-                                }
-                                return;
-                            }
-                        };
+                            _ => (
+                                librqbit::AddTorrent::from_bytes(bytes),
+                                file_idx.map(|i| vec![i]),
+                            ),
+                        }
+                    } else {
+                        (
+                            librqbit::AddTorrent::from_url(build_magnet_uri(&hash_for_task)),
+                            file_idx.map(|i| vec![i]),
+                        )
+                    };
 
                     let mut add_opts = librqbit::AddTorrentOptions::default();
                     add_opts.overwrite = true;
                     add_opts.only_files = only_files_vec;
+                    add_opts.trackers = Some(default_trackers);
                     add_opts.output_folder =
                         Some(save_dir_for_task.to_string_lossy().to_string());
 
@@ -687,7 +707,7 @@ impl TorrentEngineManager {
                                     }
                                 }
 
-                                // Spawn probe & stats loop
+                                // Spawn non-blocking stats loop (500ms tick) + detached ffprobe once bytes flow
                                 let mgr_stats = Arc::clone(&mgr);
                                 let hash_stats = hash_for_task.clone();
                                 let handle_stats = handle.clone();
@@ -695,7 +715,7 @@ impl TorrentEngineManager {
                                     let port = *mgr_stats.primary_port.read();
                                     let proxy_url =
                                         format!("http://127.0.0.1:{}/proxy/{}", port, hash_stats);
-                                    let mut probed_ok = false;
+                                    let mut probe_spawned = false;
 
                                     loop {
                                         if !mgr_stats.active_engines.read().contains_key(&hash_stats)
@@ -729,30 +749,41 @@ impl TorrentEngineManager {
                                             }
                                         }
 
-                                        if !probed_ok {
-                                            if let Ok(probe_res) = probe_media_url(&proxy_url).await
-                                            {
-                                                if probe_res.duration > 0.0 {
-                                                    probed_ok = true;
-                                                    let mut guard = mgr_stats.active_engines.write();
-                                                    if let Some(eng) = guard.get_mut(&hash_stats) {
-                                                        eng.duration = probe_res.duration;
-                                                        eng.video_codec = probe_res.video_codec;
-                                                        eng.audio_codec = probe_res.audio_codec;
-                                                        eng.embedded_subtitles =
-                                                            Some(probe_res.embedded_subtitles);
-                                                        info!(
-                                                            "[Engine] Codec Detected: {:?} / {:?} | Duration: {}s",
-                                                            eng.video_codec,
-                                                            eng.audio_codec,
-                                                            eng.duration
-                                                        );
+                                        if !probe_spawned && stats.progress_bytes > 0 {
+                                            probe_spawned = true;
+                                            let mgr_probe = Arc::clone(&mgr_stats);
+                                            let hash_probe = hash_stats.clone();
+                                            let url_probe = proxy_url.clone();
+                                            tokio::spawn(async move {
+                                                for _ in 0..2 {
+                                                    if !mgr_probe.active_engines.read().contains_key(&hash_probe) {
+                                                        break;
                                                     }
+                                                    if let Ok(probe_res) = probe_media_url(&url_probe).await {
+                                                        if probe_res.duration > 0.0 {
+                                                            let mut guard = mgr_probe.active_engines.write();
+                                                            if let Some(eng) = guard.get_mut(&hash_probe) {
+                                                                eng.duration = probe_res.duration;
+                                                                eng.video_codec = probe_res.video_codec;
+                                                                eng.audio_codec = probe_res.audio_codec;
+                                                                eng.embedded_subtitles =
+                                                                    Some(probe_res.embedded_subtitles);
+                                                                info!(
+                                                                    "[Engine] Codec Detected: {:?} / {:?} | Duration: {}s",
+                                                                    eng.video_codec,
+                                                                    eng.audio_codec,
+                                                                    eng.duration
+                                                                );
+                                                            }
+                                                            break;
+                                                        }
+                                                    }
+                                                    tokio::time::sleep(Duration::from_secs(3)).await;
                                                 }
-                                            }
+                                            });
                                         }
 
-                                        tokio::time::sleep(Duration::from_secs(2)).await;
+                                        tokio::time::sleep(Duration::from_millis(500)).await;
                                     }
                                 });
                             }
