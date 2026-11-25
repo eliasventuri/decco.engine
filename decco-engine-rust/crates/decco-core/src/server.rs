@@ -56,6 +56,12 @@ pub struct StartStreamQuery {
 
 #[derive(Debug, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
+pub struct HlsQuery {
+    pub audio_track: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
 pub struct StartDownloadQuery {
     pub hash: Option<String>,
     pub title: Option<String>,
@@ -115,7 +121,7 @@ async fn cors_and_loopback_middleware(
         );
         headers.insert(
             "Access-Control-Allow-Headers",
-            "Content-Type, Range, Authorization, X-Requested-With"
+            "Content-Type, Range, Authorization, X-Requested-With, Accept, Cache-Control"
                 .parse()
                 .unwrap(),
         );
@@ -137,7 +143,7 @@ async fn cors_and_loopback_middleware(
     );
     headers.insert(
         "Access-Control-Allow-Headers",
-        "Content-Type, Range, Authorization, X-Requested-With"
+        "Content-Type, Range, Authorization, X-Requested-With, Accept, Cache-Control"
             .parse()
             .unwrap(),
     );
@@ -178,6 +184,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/pause/:hash", get(handle_pause).post(handle_pause))
         .route("/stop/:hash", get(handle_stop).post(handle_stop))
         .route("/status/:hash", get(handle_status))
+        .route("/status/events/:hash", get(handle_status_events))
         .route("/proxy/:hash", get(handle_proxy))
         .route(
             "/cache/clear",
@@ -254,6 +261,12 @@ async fn handle_ping(State(state): State<AppState>) -> impl IntoResponse {
         "status": "ok",
         "port": port,
         "version": "2.2",
+        "engineVersion": env!("CARGO_PKG_VERSION"),
+        "capabilities": {
+            "streamSse": true,
+            "downloadSse": true,
+            "audioTracks": true
+        },
         "pong": true
     }))
 }
@@ -276,6 +289,7 @@ async fn handle_status_check() -> impl IntoResponse {
 async fn handle_prewarm(
     State(state): State<AppState>,
     AxumPath(hash): AxumPath<String>,
+    Query(_query): Query<StartStreamQuery>,
 ) -> impl IntoResponse {
     let clean_hash = hash.trim().to_ascii_lowercase();
     if clean_hash.is_empty() {
@@ -286,10 +300,17 @@ async fn handle_prewarm(
     }
     state.torrent_mgr.cancel_stop_grace_timeout(&clean_hash);
 
-    let cache_dir = state.torrent_mgr.config.streaming_cache_dir.clone();
+    let state_bg = state.clone();
     let hash_bg = clean_hash.clone();
     tokio::spawn(async move {
-        let _ = prefetch_torrent_cache_file(&hash_bg, &cache_dir).await;
+        // Fast-fetch .torrent metadata via HTTP caches in parallel (~150ms, 0 disk/checksum overhead).
+        // Do NOT spin up a full librqbit torrent engine on hover (especially for season packs where
+        // season/episode may not be passed), so real /start calls never block behind hover checksums.
+        let _ = prefetch_torrent_cache_file(
+            &hash_bg,
+            &state_bg.torrent_mgr.config.streaming_cache_dir,
+        )
+        .await;
     });
 
     (
@@ -373,6 +394,38 @@ async fn handle_status(
     AxumPath(hash): AxumPath<String>,
 ) -> impl IntoResponse {
     Json(state.torrent_mgr.get_status(&hash))
+}
+
+async fn handle_status_events(
+    State(state): State<AppState>,
+    AxumPath(hash): AxumPath<String>,
+) -> Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>> {
+    let clean_hash = hash.trim().to_ascii_lowercase();
+    let initial_payload = serde_json::to_string(&state.torrent_mgr.get_status(&clean_hash))
+        .unwrap_or_else(|_| "{}".to_string());
+    let rx = state.torrent_mgr.status_tx.subscribe();
+
+    let initial_stream = tokio_stream::once(Ok(Event::default().data(initial_payload.clone())));
+    let last_sent = std::sync::Arc::new(parking_lot::Mutex::new(initial_payload));
+    let broadcast_stream = BroadcastStream::new(rx).filter_map(move |msg| match msg {
+        Ok((evt_hash, data)) if evt_hash == clean_hash => {
+            let mut last = last_sent.lock();
+            if *last == data {
+                None
+            } else {
+                *last = data.clone();
+                Some(Ok(Event::default().data(data)))
+            }
+        }
+        _ => None,
+    });
+
+    let combined = initial_stream.chain(broadcast_stream);
+    Sse::new(combined).keep_alive(
+        KeepAlive::new()
+            .interval(Duration::from_secs(15))
+            .text("keepalive"),
+    )
 }
 
 async fn handle_cache_clear(State(state): State<AppState>) -> impl IntoResponse {
@@ -522,14 +575,26 @@ async fn serve_file_with_range(
 async fn handle_proxy(
     State(state): State<AppState>,
     AxumPath(hash): AxumPath<String>,
+    method: Method,
     headers: HeaderMap,
 ) -> Response {
     let clean_hash = hash.trim().to_ascii_lowercase();
     state.torrent_mgr.cancel_stop_grace_timeout(&clean_hash);
 
-    // 1. Check if completed download exists on disk
-    if let Some((_, local_path)) = state.downloads_mgr.find_completed_video_path(&clean_hash) {
-        return serve_file_with_range(&local_path, None, &headers).await;
+    // 1. Check active engine first so a completed episode in a season pack doesn't shadow
+    //    streaming a different episode from the same torrent hash.
+    let active_non_mock = state
+        .torrent_mgr
+        .active_engines
+        .read()
+        .get(&clean_hash)
+        .map(|e| !e.is_mock)
+        .unwrap_or(false);
+
+    if !active_non_mock {
+        if let Some((_, local_path)) = state.downloads_mgr.find_completed_video_path(&clean_hash) {
+            return serve_file_with_range(&local_path, None, &headers).await;
+        }
     }
 
     // 2. Auto-start if not active yet (Android & direct player compatibility)
@@ -568,6 +633,18 @@ async fn handle_proxy(
         return (StatusCode::NOT_FOUND, "Video file not ready").into_response();
     };
 
+    // Fast-path HTTP HEAD probes (browsers/VLC/ExoPlayer) without opening a librqbit FileStream
+    if method == Method::HEAD {
+        let content_type = get_video_content_type(&vf.name);
+        return Response::builder()
+            .status(StatusCode::OK)
+            .header("Content-Length", vf.length.to_string())
+            .header("Accept-Ranges", "bytes")
+            .header("Content-Type", content_type)
+            .body(Body::empty())
+            .unwrap();
+    }
+
     let start_byte = headers
         .get("range")
         .and_then(|v| v.to_str().ok())
@@ -585,12 +662,30 @@ async fn handle_proxy(
         return serve_reader_with_range(torrent_stream, vf.length, content_type, &headers).await;
     }
 
+    // Only fall back to direct disk read for mock (already-completed local) engines.
+    // For active P2P torrents, reading a preallocated sparse file directly would serve raw zeroes.
+    let is_mock_engine = state
+        .torrent_mgr
+        .active_engines
+        .read()
+        .get(&clean_hash)
+        .map(|e| e.is_mock)
+        .unwrap_or(false);
+    if !is_mock_engine {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Torrent stream still initializing",
+        )
+            .into_response();
+    }
+
     serve_file_with_range(&vf.path, Some(vf.length), &headers).await
 }
 
 async fn handle_hls_route(
     State(state): State<AppState>,
     AxumPath((hash, file)): AxumPath<(String, String)>,
+    Query(query): Query<HlsQuery>,
 ) -> Response {
     let clean_hash = hash.trim().to_ascii_lowercase();
     state.torrent_mgr.cancel_stop_grace_timeout(&clean_hash);
@@ -615,7 +710,7 @@ async fn handle_hls_route(
             return (StatusCode::SERVICE_UNAVAILABLE, "Wait for metadata").into_response();
         }
 
-        let manifest = build_hls_vod_manifest(eng.duration);
+        let manifest = build_hls_vod_manifest(eng.duration, query.audio_track);
         return (
             StatusCode::OK,
             [("Content-Type", "application/vnd.apple.mpegurl")],
@@ -646,7 +741,14 @@ async fn handle_hls_route(
         let port = *state.torrent_mgr.primary_port.read();
         let proxy_url = format!("http://127.0.0.1:{}/proxy/{}", port, clean_hash);
 
-        match spawn_hls_segment_transcoder(&proxy_url, seg_index, video_codec.as_deref()).await {
+        match spawn_hls_segment_transcoder(
+            &proxy_url,
+            seg_index,
+            video_codec.as_deref(),
+            query.audio_track,
+        )
+        .await
+        {
             Ok(mut child) => {
                 let Some(stdout) = child.stdout.take() else {
                     return StatusCode::INTERNAL_SERVER_ERROR.into_response();
@@ -681,7 +783,7 @@ async fn handle_list_subtitles(
     AxumPath(hash): AxumPath<String>,
 ) -> Response {
     let clean_hash = hash.trim().to_ascii_lowercase();
-    let cached_subs = {
+    let (cached_subs, cached_audio) = {
         let guard = state.torrent_mgr.active_engines.read();
         let Some(eng) = guard.get(&clean_hash) else {
             return (
@@ -697,11 +799,15 @@ async fn handle_list_subtitles(
             )
                 .into_response();
         }
-        eng.embedded_subtitles.clone()
+        (eng.embedded_subtitles.clone(), eng.audio_tracks.clone())
     };
 
     if let Some(subs) = cached_subs {
-        return Json(json!({ "subtitles": subs })).into_response();
+        return Json(json!({
+            "subtitles": subs,
+            "audioTracks": cached_audio.unwrap_or_default()
+        }))
+        .into_response();
     }
 
     let port = *state.torrent_mgr.primary_port.read();
@@ -710,6 +816,7 @@ async fn handle_list_subtitles(
     match probe_media_url(&proxy_url).await {
         Ok(probed) => {
             let subs = probed.embedded_subtitles.clone();
+            let audio_tracks = probed.audio_tracks.clone();
             {
                 let mut guard = state.torrent_mgr.active_engines.write();
                 if let Some(eng) = guard.get_mut(&clean_hash) {
@@ -718,10 +825,16 @@ async fn handle_list_subtitles(
                     }
                     eng.video_codec = probed.video_codec;
                     eng.audio_codec = probed.audio_codec;
+                    eng.audio_tracks = Some(probed.audio_tracks);
                     eng.embedded_subtitles = Some(probed.embedded_subtitles);
                 }
             }
-            Json(json!({ "subtitles": subs })).into_response()
+            state.torrent_mgr.broadcast_stream_status(&clean_hash);
+            Json(json!({
+                "subtitles": subs,
+                "audioTracks": audio_tracks
+            }))
+            .into_response()
         }
         Err(e) => {
             error!("[Subtitles] FFprobe error: {}", e);
@@ -965,6 +1078,29 @@ async fn handle_download_open(
         }
     }
 
+    #[cfg(target_os = "macos")]
+    {
+        if target_to_open.is_file() {
+            let _ = std::process::Command::new("open")
+                .arg("-R")
+                .arg(target_to_open.as_os_str())
+                .spawn();
+        } else if dl_dir.exists() {
+            let _ = std::process::Command::new("open")
+                .arg(dl_dir.as_os_str())
+                .spawn();
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        if dl_dir.exists() {
+            let _ = std::process::Command::new("xdg-open")
+                .arg(dl_dir.as_os_str())
+                .spawn();
+        }
+    }
+
     Json(json!({
         "status": "opened",
         "hash": entry.hash,
@@ -1086,22 +1222,38 @@ pub async fn start_multiport_server(state: AppState) -> anyhow::Result<Vec<u16>>
         let router = build_router(state.clone());
         let addr_v4_loopback: SocketAddr = ([127, 0, 0, 1], port).into();
 
-        let listener = match tokio::net::TcpListener::bind(addr_v4_loopback).await {
-            Ok(l) => {
-                info!(
-                    "[Server] Axum server listening on explicit loopback 127.0.0.1:{} (Firewall-safe)",
-                    port
-                );
-                Some(l)
+        // Retry briefly on AddrInUse so tray restarts / installer upgrades cleanly acquire ports
+        // as soon as the exiting instance releases its sockets (prevents `active on ports: []`).
+        let max_attempts = if bound_ports.is_empty() { 15 } else { 5 };
+        let mut listener = None;
+        for attempt in 1..=max_attempts {
+            match tokio::net::TcpListener::bind(addr_v4_loopback).await {
+                Ok(l) => {
+                    info!(
+                        "[Server] Axum server listening on explicit loopback 127.0.0.1:{} (Firewall-safe)",
+                        port
+                    );
+                    listener = Some(l);
+                    break;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AddrInUse && attempt < max_attempts => {
+                    if attempt == 1 {
+                        warn!(
+                            "[Server] Port 127.0.0.1:{} busy (likely restarting), retrying...",
+                            port
+                        );
+                    }
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                }
+                Err(e) => {
+                    warn!(
+                        "[Server] Failed to bind to 127.0.0.1:{}: {}",
+                        port, e
+                    );
+                    break;
+                }
             }
-            Err(e) => {
-                warn!(
-                    "[Server] Failed to bind to 127.0.0.1:{}: {}",
-                    port, e
-                );
-                None
-            }
-        };
+        }
 
         if let Some(tcp_listener) = listener {
             bound_ports.push(port);

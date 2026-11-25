@@ -1,7 +1,7 @@
 ; Decco Engine (Rust) - NSIS Always-Silent Installer
 
 !ifndef APP_VERSION
-  !define APP_VERSION "1.1.82"
+  !define APP_VERSION "2.0.0"
 !endif
 
 !ifndef EXE_PATH

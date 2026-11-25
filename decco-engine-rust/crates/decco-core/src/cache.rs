@@ -55,8 +55,11 @@ impl CacheManager {
         let path = self.config.cache_meta_path.clone();
         let tmp_path = path.with_extension("json.tmp");
         if let Ok(serialized) = serde_json::to_string_pretty(&snapshot) {
-            if std::fs::write(&tmp_path, serialized).is_ok() {
-                let _ = std::fs::rename(&tmp_path, &path);
+            if std::fs::write(&tmp_path, &serialized).is_ok() {
+                if std::fs::rename(&tmp_path, &path).is_err() {
+                    let _ = std::fs::write(&path, &serialized);
+                    let _ = std::fs::remove_file(&tmp_path);
+                }
             }
         }
     }
@@ -186,7 +189,7 @@ impl CacheManager {
         }
         self.save_to_disk();
 
-        let protected = ["cache-meta.json", "decco-engine.log", "update-info.json"];
+        let protected = ["cache-meta.json", "decco-engine.log", "update-info.json", "dht.json"];
         if let Ok(entries) = std::fs::read_dir(&self.config.streaming_cache_dir) {
             for entry in entries.flatten() {
                 let path = entry.path();

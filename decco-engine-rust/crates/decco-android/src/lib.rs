@@ -133,14 +133,58 @@ pub extern "system" fn Java_com_decco_core_engine_RustEngineBridge_prewarmTorren
     let Ok(hash_str) = env.get_string(&hash) else {
         return;
     };
-    let clean_hash: String = hash_str.into();
+    let clean_hash: String = String::from(hash_str).trim().to_ascii_lowercase();
+    if clean_hash.is_empty() {
+        return;
+    }
     let runtime = get_runtime();
     let guard = runtime.engine.lock();
     if let Some(ref engine) = *guard {
         let mgr = engine.state.torrent_mgr.clone();
+        let dl_mgr = engine.state.downloads_mgr.clone();
+        mgr.cancel_stop_grace_timeout(&clean_hash);
         runtime.rt.spawn(async move {
-            mgr.start_or_get_engine(&clean_hash, None, None, None, None)
-                .await;
+            let _ = decco_core::torrent::prefetch_torrent_cache_file(
+                &clean_hash,
+                &mgr.config.streaming_cache_dir,
+            )
+            .await;
+
+            let another_stream_active = mgr
+                .active_streaming_hash
+                .read()
+                .as_deref()
+                .map(|h| h != clean_hash.as_str())
+                .unwrap_or(false);
+
+            if !another_stream_active && !mgr.active_engines.read().contains_key(&clean_hash) {
+                mgr.start_or_get_engine(&clean_hash, None, None, None, None)
+                    .await;
+
+                // Auto-cleanup after 25s if the user never actually starts playback
+                let mgr_cleanup = std::sync::Arc::clone(&mgr);
+                let hash_cleanup = clean_hash.clone();
+                let timer = tokio::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_secs(25)).await;
+                    let is_shared = dl_mgr
+                        .active_downloads
+                        .read()
+                        .values()
+                        .any(|dl| dl.meta.hash == hash_cleanup);
+                    if !is_shared {
+                        mgr_cleanup.destroy_engine(&hash_cleanup);
+                        let mut active_stream = mgr_cleanup.active_streaming_hash.write();
+                        if active_stream.as_deref() == Some(hash_cleanup.as_str()) {
+                            *active_stream = None;
+                        }
+                        info!(
+                            "[Android-JNI] Cleaned up unused prewarmed torrent {}",
+                            hash_cleanup
+                        );
+                    }
+                });
+                mgr.stop_grace_timers.write().insert(clean_hash, timer);
+            }
         });
     }
 }

@@ -125,7 +125,7 @@ pub fn handle_tray_menu_event(
         } else {
             info!("[Tray] Restarting Decco Engine...");
             if let Ok(exe) = std::env::current_exe() {
-                let _ = std::process::Command::new(exe).spawn();
+                let _ = std::process::Command::new(exe).arg("--restarted").spawn();
             }
             std::process::exit(0);
         }

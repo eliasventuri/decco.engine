@@ -142,14 +142,63 @@ pub fn get_video_content_type(file_name: &str) -> &'static str {
     }
 }
 
-/// Builds regex to match episode patterns like S05E06, S5E6, 5x06, s05.e06, etc.
+/// Builds regex to match episode patterns like S05E06, S5E6, S01E005, 5x06, s05.e06, S05_E06_,
+/// Season 1 Episode 5, Temporada 1 Episodio 5, etc.
+/// Uses `(?:\D|$)` instead of `\b` so underscores (`_`) after episode numbers still match.
 pub fn build_episode_pattern(season: u32, episode: u32) -> Option<Regex> {
     let pattern = format!(
-        r"(?i)(s0?{s}[.\s_-]?e0?{e}\b)|(\b0?{s}x0?{e}\b)",
+        r"(?i)(?:^|[^a-z0-9])(?:s0*{s}[.\s_-]*e0*{e}|0*{s}x0*{e}|(?:season|temporada)[.\s_-]*0*{s}[^a-z0-9].*(?:episode|episodio|ep\.?|e)[.\s_-]*0*{e})(?:\D|$)",
         s = season,
         e = episode
     );
     Regex::new(&pattern).ok()
+}
+
+/// Returns true if a filename or relative path looks like a sample, trailer, extra, special, or creditless OP/ED
+pub fn is_sample_video(name_or_path: &str) -> bool {
+    let lower = name_or_path.to_ascii_lowercase().replace('\\', "/");
+    lower.contains("sample")
+        || lower.contains("trailer")
+        || lower.contains("featurette")
+        || lower.contains("deleted scene")
+        || lower.contains("behind the scenes")
+        || lower.contains("/extras/")
+        || lower.starts_with("extras/")
+        || lower.contains("/bonus/")
+        || lower.starts_with("bonus/")
+        || lower.contains("/specials/")
+        || lower.starts_with("specials/")
+        || lower.contains("/ncop")
+        || lower.contains("/nced")
+        || lower.contains("ncop")
+        || lower.contains("nced")
+}
+
+/// Recursively find an exact video file by filename ONLY (no largest-file fallback).
+/// Used when deleting a single episode from a shared season-pack folder.
+pub fn find_exact_video_file_strict(dir: &Path, target_name: &str) -> Option<PathBuf> {
+    if !dir.exists() || target_name.is_empty() {
+        return None;
+    }
+    let mut found: Option<PathBuf> = None;
+    fn scan_strict(current: &Path, wanted: &str, found: &mut Option<PathBuf>) {
+        if found.is_some() {
+            return;
+        }
+        if let Ok(entries) = std::fs::read_dir(current) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    scan_strict(&path, wanted, found);
+                } else if path.file_name().and_then(|n| n.to_str()) == Some(wanted) {
+                    *found = Some(path);
+                    return;
+                }
+            }
+        }
+    }
+    scan_strict(dir, target_name, &mut found);
+    found
 }
 
 /// Build composite download ID (`<hash>_s<season>e<episode>`, `<hash>_f<fileIdx>`, or `<hash>`)

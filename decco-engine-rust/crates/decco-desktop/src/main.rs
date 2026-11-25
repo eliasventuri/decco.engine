@@ -43,9 +43,20 @@ async fn main() -> anyhow::Result<()> {
 
     let args: Vec<String> = std::env::args().collect();
     let protocol_url = args.iter().find(|a| a.starts_with("decco://")).cloned();
+    let is_restarted = args.iter().any(|a| a == "--restarted");
 
-    // Enforce Single Instance Lock
-    let instance = SingleInstance::new("com.decco.engine.single-instance")?;
+    // Enforce Single Instance Lock (if restarted from tray, wait up to 3s for old instance to exit)
+    let mut instance = SingleInstance::new("com.decco.engine.single-instance")?;
+    if !instance.is_single() && is_restarted {
+        for _ in 0..30 {
+            drop(instance);
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            instance = SingleInstance::new("com.decco.engine.single-instance")?;
+            if instance.is_single() {
+                break;
+            }
+        }
+    }
     if !instance.is_single() {
         if let Some(url) = protocol_url {
             protocol::forward_link_to_running_instance(&url, DEFAULT_PRIMARY_PORT).await;

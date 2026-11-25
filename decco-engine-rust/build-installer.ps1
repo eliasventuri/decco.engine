@@ -5,21 +5,22 @@ $CargoToml = Get-Content (Join-Path $Root "Cargo.toml") -Raw
 if ($CargoToml -match '(?m)^version\s*=\s*"([^"]+)"') {
     $Version = $Matches[1]
 } else {
-    $Version = "1.1.82"
+    $Version = "2.0.0"
 }
 
 $ReleaseDir = Join-Path $Root "target\release"
 $ExePath = Join-Path $ReleaseDir "decco-engine.exe"
 
-if (-not (Test-Path $ExePath)) {
-    Write-Host "[Decco] Building decco-desktop release..."
-    $env:PATH = "C:\Program Files\NASM;$env:PATH"
-    Push-Location $Root
-    try {
-        cargo build --release -p decco-desktop
-    } finally {
-        Pop-Location
+Write-Host "[Decco] Building decco-desktop release v$Version..."
+$env:PATH = "C:\Program Files\NASM;$env:PATH"
+Push-Location $Root
+try {
+    cargo build --release -p decco-desktop
+    if ($LASTEXITCODE -ne 0) {
+        throw "cargo build failed with exit code $LASTEXITCODE"
     }
+} finally {
+    Pop-Location
 }
 
 $Makensis = @(

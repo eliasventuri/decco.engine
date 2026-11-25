@@ -17,11 +17,24 @@ pub struct EmbeddedSubtitle {
     pub is_default: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EmbeddedAudioTrack {
+    pub index: usize,
+    pub track_index: usize,
+    pub codec: String,
+    pub language: String,
+    pub title: String,
+    pub channels: u32,
+    pub is_default: bool,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ProbeResult {
     pub duration: f64,
     pub video_codec: Option<String>,
     pub audio_codec: Option<String>,
+    pub audio_tracks: Vec<EmbeddedAudioTrack>,
     pub embedded_subtitles: Vec<EmbeddedSubtitle>,
 }
 
@@ -37,7 +50,7 @@ fn hidden_command(program: &str) -> Command {
     cmd
 }
 
-/// Detects the fastest available H.264 encoder (`h264_nvenc`, `h264_qsv`, `h264_amf`, or `libx264`)
+/// Detects the fastest available H.264 encoder across Windows, macOS, and Linux
 pub async fn detect_hardware_encoder() -> &'static str {
     if let Some(enc) = HARDWARE_ENCODER.get() {
         return enc.as_str();
@@ -50,7 +63,9 @@ pub async fn detect_hardware_encoder() -> &'static str {
     {
         Ok(output) => {
             let stdout = String::from_utf8_lossy(&output.stdout);
-            if stdout.contains("h264_nvenc") {
+            if cfg!(target_os = "macos") && stdout.contains("h264_videotoolbox") {
+                "h264_videotoolbox".to_string()
+            } else if stdout.contains("h264_nvenc") {
                 "h264_nvenc".to_string()
             } else if stdout.contains("h264_qsv") {
                 "h264_qsv".to_string()
@@ -88,26 +103,35 @@ pub fn srt_to_webvtt(srt_content: &str) -> String {
     vtt
 }
 
-/// Probes duration, codecs, and embedded subtitle tracks via `ffprobe`
+/// Probes duration, codecs, and embedded subtitle tracks via `ffprobe` (with 12s timeout + kill_on_drop)
 pub async fn probe_media_url(target_url_or_path: &str) -> anyhow::Result<ProbeResult> {
-    let output = hidden_command("ffprobe")
-        .args([
-            "-v",
-            "quiet",
-            "-print_format",
-            "json",
-            "-show_format",
-            "-show_streams",
-            "-seekable",
-            "0",
-            "-probesize",
-            "5000000",
-            "-analyzeduration",
-            "5000000",
-            target_url_or_path,
-        ])
-        .output()
-        .await?;
+    let mut cmd = hidden_command("ffprobe");
+    cmd.args([
+        "-v",
+        "quiet",
+        "-print_format",
+        "json",
+        "-show_format",
+        "-show_streams",
+        "-seekable",
+        "0",
+        "-probesize",
+        "5000000",
+        "-analyzeduration",
+        "5000000",
+        target_url_or_path,
+    ])
+    .stdout(Stdio::piped())
+    .stderr(Stdio::null())
+    .kill_on_drop(true);
+
+    let child = cmd.spawn()?;
+    let output = tokio::time::timeout(
+        std::time::Duration::from_secs(12),
+        child.wait_with_output(),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("ffprobe timed out after 12s"))??;
 
     if !output.status.success() {
         anyhow::bail!("ffprobe exited with status: {}", output.status);
@@ -133,6 +157,7 @@ pub async fn probe_media_url(target_url_or_path: &str) -> anyhow::Result<ProbeRe
     }
 
     if let Some(streams) = json.get("streams").and_then(|s| s.as_array()) {
+        let mut audio_track_idx = 0usize;
         let mut sub_track_idx = 0usize;
         for stream in streams {
             let codec_type = stream
@@ -149,8 +174,47 @@ pub async fn probe_media_url(target_url_or_path: &str) -> anyhow::Result<ProbeRe
                 "video" if result.video_codec.is_none() => {
                     result.video_codec = Some(codec_name);
                 }
-                "audio" if result.audio_codec.is_none() => {
-                    result.audio_codec = Some(codec_name);
+                "audio" => {
+                    if result.audio_codec.is_none() {
+                        result.audio_codec = Some(codec_name.clone());
+                    }
+                    let index = stream
+                        .get("index")
+                        .and_then(|i| i.as_u64())
+                        .unwrap_or(audio_track_idx as u64) as usize;
+                    let language = stream
+                        .get("tags")
+                        .and_then(|t| t.get("language"))
+                        .and_then(|l| l.as_str())
+                        .unwrap_or("und")
+                        .to_string();
+                    let title = stream
+                        .get("tags")
+                        .and_then(|t| t.get("title"))
+                        .and_then(|t| t.as_str())
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or_default();
+                    let channels = stream
+                        .get("channels")
+                        .and_then(|c| c.as_u64())
+                        .unwrap_or(2) as u32;
+                    let is_default = stream
+                        .get("disposition")
+                        .and_then(|d| d.get("default"))
+                        .and_then(|f| f.as_i64())
+                        == Some(1);
+
+                    result.audio_tracks.push(EmbeddedAudioTrack {
+                        index,
+                        track_index: audio_track_idx,
+                        codec: codec_name,
+                        language,
+                        title,
+                        channels,
+                        is_default,
+                    });
+                    audio_track_idx += 1;
                 }
                 "subtitle" => {
                     let index = stream
@@ -200,13 +264,17 @@ pub async fn probe_media_url(target_url_or_path: &str) -> anyhow::Result<ProbeRe
 }
 
 /// Builds a Virtual VOD HLS `.m3u8` playlist for the given duration in seconds
-pub fn build_hls_vod_manifest(duration_secs: f64) -> String {
+pub fn build_hls_vod_manifest(duration_secs: f64, audio_track: Option<usize>) -> String {
     let effective_duration = if duration_secs > 0.0 {
         duration_secs
     } else {
         7200.0
     };
     let segment_count = (effective_duration / SEGMENT_DURATION as f64).floor() as usize;
+    let audio_query = match audio_track {
+        Some(idx) if idx > 0 => format!("?audioTrack={}", idx),
+        _ => String::new(),
+    };
 
     let mut lines = Vec::with_capacity(segment_count * 2 + 8);
     lines.push("#EXTM3U".to_string());
@@ -217,7 +285,7 @@ pub fn build_hls_vod_manifest(duration_secs: f64) -> String {
 
     for i in 0..segment_count {
         lines.push(format!("#EXTINF:{:.1},", SEGMENT_DURATION as f64));
-        lines.push(format!("segment-{}.ts", i));
+        lines.push(format!("segment-{}.ts{}", i, audio_query));
     }
 
     lines.push("#EXT-X-ENDLIST".to_string());
@@ -230,10 +298,12 @@ pub async fn spawn_hls_segment_transcoder(
     proxy_url: &str,
     seg_index: u64,
     video_codec: Option<&str>,
+    audio_track: Option<usize>,
 ) -> anyhow::Result<Child> {
     let start_time = seg_index * SEGMENT_DURATION;
     let is_h264 = video_codec == Some("h264");
     let hw_encoder = detect_hardware_encoder().await;
+    let audio_idx = audio_track.unwrap_or(0);
 
     let transcode_mode = if is_h264 {
         "Direct Remux".to_string()
@@ -242,10 +312,11 @@ pub async fn spawn_hls_segment_transcoder(
     };
 
     info!(
-        "[HLS] Parsing seg {} ({}s) | Codec: {} | Mode: {}",
+        "[HLS] Parsing seg {} ({}s) | Codec: {} | Audio: #{} | Mode: {}",
         seg_index,
         start_time,
         video_codec.unwrap_or("Unknown"),
+        audio_idx,
         transcode_mode
     );
 
@@ -260,8 +331,13 @@ pub async fn spawn_hls_segment_transcoder(
         cmd.arg("-seekable").arg("0");
     }
 
+    let audio_map = format!("0:a:{}?", audio_idx);
     cmd.arg("-i").arg(proxy_url);
     cmd.args([
+        "-map",
+        "0:v:0",
+        "-map",
+        &audio_map,
         "-t",
         &SEGMENT_DURATION.to_string(),
         "-output_ts_offset",
@@ -277,6 +353,18 @@ pub async fn spawn_hls_segment_transcoder(
         cmd.args(["-c:v", "copy"]);
     } else {
         match hw_encoder {
+            "h264_videotoolbox" => {
+                cmd.args([
+                    "-pix_fmt",
+                    "yuv420p",
+                    "-c:v",
+                    "h264_videotoolbox",
+                    "-realtime",
+                    "true",
+                    "-g",
+                    "48",
+                ]);
+            }
             "h264_nvenc" => {
                 cmd.args([
                     "-pix_fmt",
@@ -389,12 +477,16 @@ mod tests {
 
     #[test]
     fn build_hls_vod_manifest_generates_expected_segments() {
-        let m3u8 = build_hls_vod_manifest(35.0);
+        let m3u8 = build_hls_vod_manifest(35.0, None);
         assert!(m3u8.contains("#EXTM3U"));
         assert!(m3u8.contains("segment-0.ts"));
         assert!(m3u8.contains("segment-2.ts"));
         assert!(!m3u8.contains("segment-3.ts"));
         assert!(m3u8.ends_with("#EXT-X-ENDLIST"));
+
+        let m3u8_alt_audio = build_hls_vod_manifest(35.0, Some(2));
+        assert!(m3u8_alt_audio.contains("segment-0.ts?audioTrack=2"));
+        assert!(m3u8_alt_audio.contains("segment-2.ts?audioTrack=2"));
     }
 }
 

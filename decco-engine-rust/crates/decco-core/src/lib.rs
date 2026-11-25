@@ -59,7 +59,8 @@ impl DeccoEngine {
 
     /// Starts the multi-port HTTP server and background workers
     pub async fn start(&self) -> anyhow::Result<Vec<u16>> {
-        // Pre-warm hardware encoder detection in background
+        // Pre-warm hardware encoder detection in background (Desktop only; Android uses native ExoPlayer)
+        #[cfg(not(target_os = "android"))]
         tokio::spawn(async {
             let _ = crate::transcode::detect_hardware_encoder().await;
         });

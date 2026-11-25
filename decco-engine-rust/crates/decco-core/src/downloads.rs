@@ -1,8 +1,8 @@
 use crate::config::{
-    find_exact_video_file, get_download_id, is_video_file, now_ms, EngineConfig,
-    AUTO_RESUME_DELAY_MS, STALLED_TIMEOUT_MS, STOP_GRACE_PERIOD_MS,
+    find_exact_video_file, find_exact_video_file_strict, get_download_id, is_video_file, now_ms,
+    EngineConfig, AUTO_RESUME_DELAY_MS, STALLED_TIMEOUT_MS, STOP_GRACE_PERIOD_MS,
 };
-use crate::torrent::TorrentEngineManager;
+use crate::torrent::{select_target_video_file_with_title, TorrentEngineManager};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -261,23 +261,47 @@ impl DownloadsManager {
             if let Some(active) = active_guard.get(download_id) {
                 let mut item = active.meta.clone();
                 if let Some(eng) = active_engines_guard.get(&item.hash) {
-                    if let Some(ref vf) = eng.video_file {
-                        if item.file_name.is_none() {
-                            item.file_name = Some(vf.name.clone());
-                        }
-                        if item.file_size == 0 {
-                            item.file_size = vf.length;
-                        }
+                    // O(1) lookup when file_idx + file_name are already resolved; fall back to selector only once
+                    let resolved_vf = if let (Some(idx), Some(ref expected_name)) =
+                        (item.file_idx, &item.file_name)
+                    {
+                        eng.files
+                            .get(idx)
+                            .filter(|f| f.name == *expected_name)
+                            .cloned()
+                    } else if !eng.files.is_empty() {
+                        let s_opt = if item.season > 0 { Some(item.season) } else { None };
+                        let e_opt = if item.episode > 0 { Some(item.episode) } else { None };
+                        select_target_video_file_with_title(
+                            &eng.files,
+                            Some(&item.title),
+                            item.file_idx,
+                            s_opt,
+                            e_opt,
+                        )
+                    } else {
+                        eng.video_file.clone()
+                    };
+
+                    if let Some(ref vf) = resolved_vf {
+                        item.file_idx = Some(vf.index);
+                        item.file_name = Some(vf.name.clone());
+                        item.file_size = vf.length;
                         if item.status == "loading" {
                             item.status = "downloading".to_string();
                         }
-                    }
-                    if item.status == "downloading" {
-                        item.progress = eng.progress.max(item.progress);
-                        item.speed = eng.download_speed_bytes;
-                        item.peers = eng.peers;
-                        if item.speed > 0 || item.peers > 0 || item.progress > 0.0 {
-                            item.is_stalled = false;
+                        if item.status == "downloading" {
+                            if let Some(&file_bytes) = eng.file_progress.get(vf.index) {
+                                let clamped = file_bytes.min(vf.length);
+                                item.downloaded_bytes = clamped;
+                                if vf.length > 0 {
+                                    item.progress = (clamped as f64 / vf.length as f64).min(1.0);
+                                }
+                            }
+                            item.peers = eng.peers;
+                            if item.speed > 0 || item.peers > 0 || item.progress > 0.0 {
+                                item.is_stalled = false;
+                            }
                         }
                     }
                 }
@@ -288,12 +312,49 @@ impl DownloadsManager {
             } else {
                 let mut item = entry.clone();
                 let is_completed = item.status == "completed";
+                // If this queued/paused episode shares an already-loaded pack engine, fill in its real file size
+                if !is_completed && item.file_size == 0 {
+                    if let Some(eng) = active_engines_guard.get(&item.hash) {
+                        if !eng.files.is_empty() {
+                            let s_opt = if item.season > 0 { Some(item.season) } else { None };
+                            let e_opt = if item.episode > 0 { Some(item.episode) } else { None };
+                            let vf_opt = item
+                                .file_idx
+                                .and_then(|idx| eng.files.get(idx).cloned())
+                                .filter(|f| {
+                                    s_opt.is_none()
+                                        || e_opt.is_none()
+                                        || item.file_name.as_deref() == Some(f.name.as_str())
+                                })
+                                .or_else(|| {
+                                    select_target_video_file_with_title(
+                                        &eng.files,
+                                        Some(&item.title),
+                                        item.file_idx,
+                                        s_opt,
+                                        e_opt,
+                                    )
+                                });
+                            if let Some(vf) = vf_opt {
+                                item.file_idx = Some(vf.index);
+                                item.file_name = Some(vf.name);
+                                item.file_size = vf.length;
+                            }
+                        }
+                    }
+                }
                 item.progress = if is_completed { 1.0 } else { item.progress };
                 item.speed = 0;
                 item.peers = 0;
                 item.eta = None;
                 item.is_stalled = false;
-                item.downloaded_bytes = if is_completed { item.file_size } else { 0 };
+                item.downloaded_bytes = if is_completed {
+                    item.file_size
+                } else if item.file_size > 0 && item.progress > 0.0 {
+                    (item.progress * item.file_size as f64).round() as u64
+                } else {
+                    0
+                };
                 result.push(item);
             }
         }
@@ -456,17 +517,22 @@ impl DownloadsManager {
         scan_and_clean(download_dir, &wanted_files);
     }
 
-    /// Starts queued downloads up to `settings.max_concurrent`
+    /// Starts queued downloads up to `settings.max_concurrent` (at most 1 active episode per torrent pack
+    /// so each episode gets 100% of the pack's swarm bandwidth without stalling sibling episodes).
     pub fn pump_download_queue(self: &Arc<Self>) {
-        let (max_concurrent, queued_items) = {
+        let queued_items = {
             let db_guard = self.db.read();
             let active_guard = self.active_downloads.read();
             let max_c = db_guard.settings.max_concurrent;
 
-            let currently_downloading = active_guard
-                .values()
-                .filter(|dl| dl.meta.status == "downloading" || dl.meta.status == "loading")
-                .count();
+            let mut active_hashes: HashSet<String> = HashSet::new();
+            let mut currently_downloading = 0usize;
+            for dl in active_guard.values() {
+                if dl.meta.status == "downloading" || dl.meta.status == "loading" {
+                    currently_downloading += 1;
+                    active_hashes.insert(dl.meta.hash.clone());
+                }
+            }
 
             if max_c > 0 && currently_downloading >= max_c {
                 return;
@@ -485,12 +551,29 @@ impl DownloadsManager {
                 .cloned()
                 .collect();
 
-            queued.sort_by_key(|d| d.queue_position.unwrap_or(d.started_at));
-            queued.truncate(available_slots);
-            (max_c, queued)
+            queued.sort_by_key(|d| {
+                (
+                    d.queue_position.unwrap_or(d.started_at),
+                    d.season,
+                    d.episode,
+                )
+            });
+
+            let mut selected = Vec::new();
+            for item in queued {
+                if selected.len() >= available_slots {
+                    break;
+                }
+                // Only run 1 episode at a time per shared pack torrent
+                if active_hashes.contains(&item.hash) {
+                    continue;
+                }
+                active_hashes.insert(item.hash.clone());
+                selected.push(item);
+            }
+            selected
         };
 
-        let _ = max_concurrent;
         for item in queued_items {
             info!("[Queue] Starting queued item: {} ({})", item.title, item.id);
             self.start_download(
@@ -558,30 +641,46 @@ impl DownloadsManager {
             .join(&clean_hash[..clean_hash.len().min(16)]);
         let download_dir_str = download_dir_path.to_string_lossy().to_string();
 
-        // Concurrency queue check
+        // Concurrency & same-pack serialization check:
+        // BitTorrent downloads pieces sequentially within a torrent, so running >1 episode of the
+        // same pack simultaneously starves the second episode at 0 KB/s. Auto-queue sibling episodes
+        // of the same pack so they download back-to-back at 100% speed on the shared swarm.
         if !bypass_queue {
-            let (max_concurrent, currently_downloading, existing_entry) = {
+            let (max_concurrent, currently_downloading, same_hash_busy, existing_entry) = {
                 let db_guard = self.db.read();
                 let active_guard = self.active_downloads.read();
-                let count = active_guard
-                    .iter()
-                    .filter(|(k, dl)| {
-                        *k != &download_id
-                            && (dl.meta.status == "downloading" || dl.meta.status == "loading")
-                    })
-                    .count();
+                let mut count = 0usize;
+                let mut same_hash = false;
+                for (k, dl) in active_guard.iter() {
+                    if *k != download_id
+                        && (dl.meta.status == "downloading" || dl.meta.status == "loading")
+                    {
+                        count += 1;
+                        if dl.meta.hash == clean_hash {
+                            same_hash = true;
+                        }
+                    }
+                }
                 (
                     db_guard.settings.max_concurrent,
                     count,
+                    same_hash,
                     db_guard.downloads.get(&download_id).cloned(),
                 )
             };
 
-            if max_concurrent > 0 && currently_downloading >= max_concurrent {
-                info!(
-                    "[Downloads] Concurrency limit reached ({}/{}). Queueing {}",
-                    currently_downloading, max_concurrent, title
-                );
+            if same_hash_busy || (max_concurrent > 0 && currently_downloading >= max_concurrent) {
+                if same_hash_busy {
+                    info!(
+                        "[Downloads] Another episode from pack {} is active. Queueing {} S{:02}E{:02} for sequential download.",
+                        &clean_hash[..clean_hash.len().min(12)], title, season, episode
+                    );
+                } else {
+                    info!(
+                        "[Downloads] Concurrency limit reached ({}/{}). Queueing {}",
+                        currently_downloading, max_concurrent, title
+                    );
+                }
                 let now = now_ms();
                 let resolved_poster = if !poster.trim().is_empty() {
                     poster.trim().to_string()
@@ -634,23 +733,28 @@ impl DownloadsManager {
             }
         }
 
-        // Hot upgrade: capture streaming engine path quickly (in-memory only); offload fs moves to background task
-        let was_streaming = {
+        // Hot upgrade: detect active streaming engine ONLY if no other active download already owns this hash
+        // and the engine is currently in the streaming cache directory (not the permanent download dir).
+        let other_active_uses_hash = self
+            .active_downloads
+            .read()
+            .iter()
+            .any(|(k, dl)| k != &download_id && dl.meta.hash == clean_hash);
+        let was_streaming = if other_active_uses_hash {
+            false
+        } else {
             let guard = self.torrent_mgr.active_engines.read();
             guard
                 .get(&clean_hash)
-                .map(|e| !e.is_mock)
+                .map(|e| !e.is_mock && e.save_dir != download_dir_path)
                 .unwrap_or(false)
         };
-        let migration_src_path = if was_streaming {
+        if was_streaming {
             info!(
                 "[Downloads] Found active streaming engine for {}. Upgrading to permanent download...",
                 clean_hash
             );
-            self.torrent_mgr.destroy_engine(&clean_hash)
-        } else {
-            None
-        };
+        }
 
         let existing_meta = self.db.read().downloads.get(&download_id).cloned();
         if let Some(ref existing) = existing_meta {
@@ -757,10 +861,16 @@ impl DownloadsManager {
         let dl_mgr = Arc::clone(self);
         let dl_id_poll = download_id.clone();
         let hash_poll = clean_hash.clone();
+        let title_poll = meta.title.clone();
         let imdb_poll = imdb_id.to_string();
         let dl_dir_poll = download_dir_path.clone();
 
         let poll_handle = tokio::spawn(async move {
+            let migration_src_path = if was_streaming {
+                dl_mgr.torrent_mgr.destroy_engine_async(&hash_poll).await
+            } else {
+                None
+            };
             let dl_dir_setup = dl_dir_poll.clone();
             let hash_setup = hash_poll.clone();
             let cache_mgr = dl_mgr.torrent_mgr.cache.clone();
@@ -796,7 +906,20 @@ impl DownloadsManager {
                 )
                 .await;
 
+            struct AbortOnDrop(Option<JoinHandle<()>>);
+            impl Drop for AbortOnDrop {
+                fn drop(&mut self) {
+                    if let Some(h) = self.0.take() {
+                        h.abort();
+                    }
+                }
+            }
+
             let mut subs_fetched = false;
+            let mut synced_file_idx: Option<usize> = None;
+            let mut speed_samples: std::collections::VecDeque<(std::time::Instant, u64)> =
+                std::collections::VecDeque::with_capacity(8);
+            let mut concurrent_puller = AbortOnDrop(None);
 
             loop {
                 tokio::time::sleep(Duration::from_secs(1)).await;
@@ -812,9 +935,24 @@ impl DownloadsManager {
                     break;
                 };
 
+                // Resolve THIS episode's exact file ONCE after metadata is ready (O(1) on subsequent ticks)
+                let target_vf = if let Some(idx) = synced_file_idx {
+                    eng.files.get(idx).cloned()
+                } else if eng.metadata_ready && !eng.files.is_empty() {
+                    select_target_video_file_with_title(
+                        &eng.files,
+                        Some(&title_poll),
+                        file_idx,
+                        if season > 0 { Some(season) } else { None },
+                        if episode > 0 { Some(episode) } else { None },
+                    )
+                } else {
+                    None
+                };
+
                 if eng.metadata_ready && !subs_fetched {
-                    subs_fetched = true;
-                    if let Some(ref vf) = eng.video_file {
+                    if let Some(ref vf) = target_vf {
+                        subs_fetched = true;
                         let dl_mgr_subs = Arc::clone(&dl_mgr);
                         let dl_id_subs = dl_id_poll.clone();
                         let imdb_subs = imdb_poll.clone();
@@ -838,26 +976,88 @@ impl DownloadsManager {
                 let mut completed_now = false;
                 let mut completed_file_name: Option<String> = None;
                 let mut updated_meta: Option<DownloadItemMeta> = None;
+                let mut need_sync_files = false;
+                let mut active_same_hash_snapshot = 1usize;
 
                 {
                     let mut guard = dl_mgr.active_downloads.write();
+                    let active_same_hash_count = guard
+                        .values()
+                        .filter(|dl| {
+                            dl.meta.hash == hash_poll
+                                && (dl.meta.status == "downloading" || dl.meta.status == "loading")
+                        })
+                        .count();
+                    active_same_hash_snapshot = active_same_hash_count;
+
                     let Some(active) = guard.get_mut(&dl_id_poll) else {
                         break;
                     };
 
-                    if let Some(ref vf) = eng.video_file {
+                    if let Some(ref vf) = target_vf {
+                        active.meta.file_idx = Some(vf.index);
                         active.meta.file_name = Some(vf.name.clone());
                         active.meta.file_size = vf.length;
                         if active.meta.status == "loading" {
                             active.meta.status = "downloading".to_string();
                         }
-                    }
+                        if synced_file_idx != Some(vf.index) {
+                            synced_file_idx = Some(vf.index);
+                            need_sync_files = true;
+                        }
 
-                    active.meta.progress = eng.progress;
-                    active.meta.speed = eng.download_speed_bytes;
-                    active.meta.peers = eng.peers;
-                    active.meta.downloaded_bytes =
-                        (eng.progress * active.meta.file_size as f64).round() as u64;
+                        // Per-file progress from librqbit `stats.file_progress[file_idx]`
+                        let file_bytes = eng
+                            .file_progress
+                            .get(vf.index)
+                            .copied()
+                            .unwrap_or(0)
+                            .min(vf.length);
+                        let file_progress = if vf.length > 0 {
+                            (file_bytes as f64 / vf.length as f64).min(1.0)
+                        } else {
+                            0.0
+                        };
+
+                        let now_inst = std::time::Instant::now();
+                        speed_samples.push_back((now_inst, file_bytes));
+                        while speed_samples.len() > 2 {
+                            if let Some(&(t0, _)) = speed_samples.front() {
+                                if now_inst.duration_since(t0) > Duration::from_secs(6) {
+                                    speed_samples.pop_front();
+                                    continue;
+                                }
+                            }
+                            break;
+                        }
+
+                        let per_file_speed = if active_same_hash_count <= 1 {
+                            eng.download_speed_bytes
+                        } else if let (Some(&(t0, b0)), Some(&(t1, b1))) =
+                            (speed_samples.front(), speed_samples.back())
+                        {
+                            let elapsed = t1.duration_since(t0).as_secs_f64();
+                            if elapsed >= 0.5 {
+                                (b1.saturating_sub(b0) as f64 / elapsed) as u64
+                            } else {
+                                eng.download_speed_bytes / (active_same_hash_count as u64).max(1)
+                            }
+                        } else {
+                            eng.download_speed_bytes / (active_same_hash_count as u64).max(1)
+                        };
+
+                        active.meta.downloaded_bytes = file_bytes;
+                        active.meta.progress = file_progress;
+                        active.meta.speed = per_file_speed;
+                        active.meta.peers = eng.peers;
+                    } else {
+                        active.meta.peers = eng.peers;
+                        active.meta.speed = if active_same_hash_count <= 1 {
+                            eng.download_speed_bytes
+                        } else {
+                            0
+                        };
+                    }
 
                     if active.meta.speed > 0 || active.meta.peers > 0 || active.meta.progress > 0.0
                     {
@@ -877,10 +1077,14 @@ impl DownloadsManager {
                         active.meta.eta = None;
                     }
 
-                    if active.meta.progress >= 1.0 && active.meta.status == "downloading" {
+                    if active.meta.file_size > 0
+                        && active.meta.downloaded_bytes >= active.meta.file_size
+                        && active.meta.status == "downloading"
+                    {
                         active.meta.status = "completed".to_string();
                         active.meta.completed_at = Some(now_ms());
                         active.meta.progress = 1.0;
+                        active.meta.speed = 0;
                         active.meta.eta = Some(0);
                         completed_now = true;
                         completed_file_name = active.meta.file_name.clone();
@@ -888,13 +1092,74 @@ impl DownloadsManager {
                     }
                 }
 
+                if need_sync_files {
+                    let desired = dl_mgr.collect_active_file_indices(&hash_poll);
+                    if !desired.is_empty() {
+                        dl_mgr.torrent_mgr.sync_only_files(&hash_poll, desired).await;
+                    }
+                }
+
+                // When multiple episodes of the SAME pack are actively downloading concurrently
+                // (e.g. via Force Start), open a lightweight librqbit FileStream per episode so
+                // librqbit's piece picker interleaves piece requests across ALL active episodes
+                // simultaneously instead of starving later episodes until the first finishes.
+                #[cfg(feature = "rqbit-backend")]
+                if !completed_now && active_same_hash_snapshot > 1 {
+                    if concurrent_puller.0.is_none() {
+                        if let Some(ref vf) = target_vf {
+                            if let Some(mut stream) = dl_mgr
+                                .torrent_mgr
+                                .open_stream_for_file_idx(&hash_poll, vf.index)
+                            {
+                                info!(
+                                    "[Downloads] Activating concurrent piece puller for {} (file_idx={})",
+                                    vf.name, vf.index
+                                );
+                                concurrent_puller.0 = Some(tokio::spawn(async move {
+                                    use tokio::io::AsyncReadExt;
+                                    let mut buf = vec![0u8; 64 * 1024];
+                                    loop {
+                                        match stream.read(&mut buf).await {
+                                            Ok(0) | Err(_) => break,
+                                            Ok(_) => {}
+                                        }
+                                    }
+                                }));
+                            }
+                        }
+                    }
+                } else if let Some(h) = concurrent_puller.0.take() {
+                    h.abort();
+                }
+
                 if completed_now {
+                    dl_mgr.active_downloads.write().remove(&dl_id_poll);
                     if let Some(meta_to_save) = updated_meta {
-                        info!("[Downloads] COMPLETED: {}", meta_to_save.title);
+                        info!(
+                            "[Downloads] COMPLETED: {} ({})",
+                            meta_to_save.title,
+                            meta_to_save.file_name.as_deref().unwrap_or("")
+                        );
                         dl_mgr.persist_download_meta(&dl_id_poll, &meta_to_save);
                     }
-                    if let Some(fname) = completed_file_name {
-                        dl_mgr.cleanup_unwanted_files(&dl_dir_poll, &fname);
+                    // Update shared torrent file selection so other episodes continue uninterrupted
+                    let remaining_active = dl_mgr.collect_active_file_indices(&hash_poll);
+                    if !remaining_active.is_empty() {
+                        dl_mgr
+                            .torrent_mgr
+                            .sync_only_files(&hash_poll, remaining_active)
+                            .await;
+                    }
+                    // Only clean up unwanted files when no other incomplete download shares this season pack
+                    let has_other_incomplete = dl_mgr.db.read().downloads.values().any(|d| {
+                        d.hash == hash_poll
+                            && d.id != dl_id_poll
+                            && d.status != "completed"
+                    });
+                    if !has_other_incomplete {
+                        if let Some(fname) = completed_file_name {
+                            dl_mgr.cleanup_unwanted_files(&dl_dir_poll, &fname);
+                        }
                     }
                     dl_mgr.broadcast_download_events();
                     dl_mgr.pump_download_queue();
@@ -913,6 +1178,68 @@ impl DownloadsManager {
         meta
     }
 
+    /// Collects the union of resolved `file_idx`s for all active downloads (and active stream) sharing `clean_hash`.
+    fn collect_active_file_indices(&self, clean_hash: &str) -> HashSet<usize> {
+        let mut indices = HashSet::new();
+        {
+            let guard = self.active_downloads.read();
+            for dl in guard.values() {
+                if dl.meta.hash == clean_hash
+                    && (dl.meta.status == "downloading" || dl.meta.status == "loading")
+                {
+                    if let Some(idx) = dl.meta.file_idx {
+                        indices.insert(idx);
+                    }
+                }
+            }
+        }
+        let is_streaming_this_hash = self
+            .torrent_mgr
+            .active_streaming_hash
+            .read()
+            .as_deref()
+            == Some(clean_hash);
+        if is_streaming_this_hash {
+            if let Some(eng) = self.torrent_mgr.active_engines.read().get(clean_hash) {
+                if let Some(ref vf) = eng.video_file {
+                    indices.insert(vf.index);
+                }
+            }
+        }
+        indices
+    }
+
+    /// Either updates `librqbit` `only_files` (when other episodes/streams still share `clean_hash`)
+    /// or destroys the torrent engine (when nothing else uses `clean_hash`).
+    fn release_or_update_hash_engine(&self, clean_hash: &str) {
+        let has_other_active = self
+            .active_downloads
+            .read()
+            .values()
+            .any(|dl| dl.meta.hash == clean_hash);
+        let is_streaming_this_hash = self
+            .torrent_mgr
+            .active_streaming_hash
+            .read()
+            .as_deref()
+            == Some(clean_hash);
+
+        if has_other_active || is_streaming_this_hash {
+            let remaining = self.collect_active_file_indices(clean_hash);
+            if !remaining.is_empty() {
+                let mgr = Arc::clone(&self.torrent_mgr);
+                let hash_owned = clean_hash.to_string();
+                if let Ok(rt) = tokio::runtime::Handle::try_current() {
+                    rt.spawn(async move {
+                        mgr.sync_only_files(&hash_owned, remaining).await;
+                    });
+                }
+            }
+        } else {
+            self.torrent_mgr.destroy_engine(clean_hash);
+        }
+    }
+
     /// Resolves a download ID by exact ID or by matching torrent hash
     fn resolve_download_id(&self, id_or_hash: &str) -> Option<String> {
         let clean = id_or_hash.trim();
@@ -929,7 +1256,7 @@ impl DownloadsManager {
         None
     }
 
-    pub fn pause_download(&self, id_or_hash: &str) -> Option<DownloadItemMeta> {
+    pub fn pause_download(self: &Arc<Self>, id_or_hash: &str) -> Option<DownloadItemMeta> {
         let download_id = self.resolve_download_id(id_or_hash)?;
         let mut active_opt = self.active_downloads.write().remove(&download_id);
 
@@ -940,7 +1267,6 @@ impl DownloadsManager {
             if let Some(h) = active.stalled_handle.take() {
                 h.abort();
             }
-            self.torrent_mgr.destroy_engine(&active.meta.hash);
             active.meta.status = "paused".to_string();
             active.meta.auto_paused_for_stream = false;
             {
@@ -949,6 +1275,10 @@ impl DownloadsManager {
                     .downloads
                     .insert(download_id.clone(), active.meta.clone());
             }
+            // Pump queue BEFORE releasing the engine so a queued sibling episode from the same pack
+            // seamlessly takes over the already-connected torrent swarm with zero reconnect delay.
+            self.pump_download_queue();
+            self.release_or_update_hash_engine(&active.meta.hash);
             self.broadcast_download_events();
             self.save_downloads_meta_async();
             return Some(active.meta.clone());
@@ -999,20 +1329,25 @@ impl DownloadsManager {
         Some(meta)
     }
 
-    pub fn delete_download(&self, id_or_hash: &str) -> (String, String) {
+    pub fn delete_download(self: &Arc<Self>, id_or_hash: &str) -> (String, String) {
         let download_id = self
             .resolve_download_id(id_or_hash)
             .unwrap_or_else(|| id_or_hash.to_string());
 
         let entry = self.db.write().downloads.remove(&download_id);
-        if let Some(mut active) = self.active_downloads.write().remove(&download_id) {
+        // IMPORTANT: Drop `active_downloads` write guard BEFORE calling `pump_download_queue` / `release_or_update_hash_engine`
+        // (which read `active_downloads`), otherwise parking_lot::RwLock self-deadlocks!
+        let removed_active = self.active_downloads.write().remove(&download_id);
+        if let Some(mut active) = removed_active {
             if let Some(h) = active.poll_handle.take() {
                 h.abort();
             }
             if let Some(h) = active.stalled_handle.take() {
                 h.abort();
             }
-            self.torrent_mgr.destroy_engine(&active.meta.hash);
+            // Start any queued sibling episode from the same pack before deciding whether to destroy the engine
+            self.pump_download_queue();
+            self.release_or_update_hash_engine(&active.meta.hash);
         }
 
         let hash_ret = entry
@@ -1043,7 +1378,15 @@ impl DownloadsManager {
             let cleanup_task = move || {
                 if other_shares_hash {
                     if let Some(fname) = file_name {
-                        let _ = std::fs::remove_file(dl_dir.join(fname));
+                        // Retry briefly in case librqbit is releasing the file handle after update_only_files
+                        for attempt in 1..=4 {
+                            let target = find_exact_video_file_strict(&dl_dir, &fname)
+                                .unwrap_or_else(|| dl_dir.join(&fname));
+                            if !target.exists() || std::fs::remove_file(&target).is_ok() {
+                                break;
+                            }
+                            std::thread::sleep(Duration::from_millis(250 * attempt));
+                        }
                     }
                     for sub in subtitles {
                         let _ = std::fs::remove_file(&sub.path);
@@ -1214,13 +1557,16 @@ impl DownloadsManager {
                 .read()
                 .get(&dl_id)
                 .map(|dl| {
-                    dl.meta.hash != clean_target
-                        && (dl.meta.status == "downloading" || dl.meta.status == "loading")
+                    // Pause ANY competing background download (including other episodes in the same season pack)
+                    // so active playback ALWAYS gets 100% of bandwidth & disk I/O priority.
+                    dl.meta.status == "downloading" || dl.meta.status == "loading"
                 })
                 .unwrap_or(false);
 
             if should_pause {
-                if let Some(mut active) = self.active_downloads.write().remove(&dl_id) {
+                // Drop `active_downloads` write guard before calling `release_or_update_hash_engine`
+                let removed_active = self.active_downloads.write().remove(&dl_id);
+                if let Some(mut active) = removed_active {
                     info!(
                         "[Downloads] Auto-pausing background download \"{}\" ({}) to maximize bandwidth for active playback ({})",
                         active.meta.title, dl_id, clean_target
@@ -1231,7 +1577,7 @@ impl DownloadsManager {
                     if let Some(h) = active.stalled_handle.take() {
                         h.abort();
                     }
-                    self.torrent_mgr.destroy_engine(&active.meta.hash);
+                    self.release_or_update_hash_engine(&active.meta.hash);
                     active.meta.status = "paused".to_string();
                     active.meta.auto_paused_for_stream = true;
                     self.persist_download_meta(&dl_id, &active.meta);
@@ -1263,6 +1609,13 @@ impl DownloadsManager {
                 .write()
                 .remove(&hash_clone);
 
+            {
+                let mut active_stream = dl_mgr.torrent_mgr.active_streaming_hash.write();
+                if active_stream.as_deref() == Some(hash_clone.as_str()) {
+                    *active_stream = None;
+                }
+            }
+
             let is_shared = dl_mgr
                 .active_downloads
                 .read()
@@ -1275,12 +1628,14 @@ impl DownloadsManager {
                     "[Engine] Stopped streaming engine for {} (playback exited after grace period)",
                     hash_clone
                 );
-            }
-
-            {
-                let mut active_stream = dl_mgr.torrent_mgr.active_streaming_hash.write();
-                if active_stream.as_deref() == Some(hash_clone.as_str()) {
-                    *active_stream = None;
+            } else {
+                // Keep shared pack engine alive for active downloads, but drop the stopped stream's file from only_files
+                if let Some(eng) = dl_mgr.torrent_mgr.active_engines.write().get_mut(&hash_clone) {
+                    eng.streaming_file_idx = None;
+                }
+                let remaining = dl_mgr.collect_active_file_indices(&hash_clone);
+                if !remaining.is_empty() {
+                    dl_mgr.torrent_mgr.sync_only_files(&hash_clone, remaining).await;
                 }
             }
 
