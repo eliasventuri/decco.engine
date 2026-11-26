@@ -83,7 +83,28 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 Copy-Item -Path $SetupOut -Destination $LatestOut -Force
+
+# Generate electron-updater compatible latest.yml so legacy v1.1.x Electron installations auto-update seamlessly to Rust v2+
+$SetupBytes = [System.IO.File]::ReadAllBytes($SetupOut)
+$Sha512Hasher = [System.Security.Cryptography.SHA512]::Create()
+$Sha512Base64 = [Convert]::ToBase64String($Sha512Hasher.ComputeHash($SetupBytes))
+$SetupFileName = Split-Path $SetupOut -Leaf
+$ReleaseDateIso = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss.fffZ")
+$LatestYmlOut = Join-Path $ReleaseDir "latest.yml"
+$LatestYmlContent = @(
+    "version: $Version",
+    "files:",
+    "  - url: $SetupFileName",
+    "    sha512: $Sha512Base64",
+    "    size: $($SetupBytes.Length)",
+    "path: $SetupFileName",
+    "sha512: $Sha512Base64",
+    "releaseDate: '$ReleaseDateIso'"
+) -join "`n"
+[System.IO.File]::WriteAllText($LatestYmlOut, "$LatestYmlContent`n")
+
 Write-Host "[Decco] Installer ready (v$Version):"
 Write-Host "  - $SetupOut"
 Write-Host "  - $LatestOut"
+Write-Host "  - $LatestYmlOut"
 Write-Host "  - Silent test: `"$SetupOut`" /S"
