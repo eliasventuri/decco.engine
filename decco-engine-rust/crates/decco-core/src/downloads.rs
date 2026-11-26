@@ -1458,15 +1458,79 @@ impl DownloadsManager {
             for item in db_guard.downloads.values_mut() {
                 if item.status == "paused" {
                     item.status = "queued".to_string();
-                    item.queue_position = Some(now + count as u64);
+                    item.auto_paused_for_stream = false;
+                    if item.queue_position.is_none() {
+                        item.queue_position = Some(now + count as u64);
+                    }
                     count += 1;
                 }
             }
         }
-        self.save_downloads_meta();
+        self.save_downloads_meta_async();
         self.pump_download_queue();
         self.broadcast_download_events();
         count
+    }
+
+    /// Persists an explicit user-defined queue order (from Web drag-and-drop) and pumps the queue
+    pub fn reorder_downloads(self: &Arc<Self>, ordered_ids: &[String]) -> usize {
+        let mut updated = 0usize;
+        {
+            let mut db_guard = self.db.write();
+            let mut assigned = HashSet::new();
+            let mut pos = 1u64;
+            for raw in ordered_ids {
+                let target_id = if db_guard.downloads.contains_key(raw) {
+                    Some(raw.clone())
+                } else {
+                    let lower = raw.trim().to_ascii_lowercase();
+                    db_guard
+                        .downloads
+                        .iter()
+                        .find(|(k, v)| k.eq_ignore_ascii_case(&lower) || v.hash == lower)
+                        .map(|(k, _)| k.clone())
+                };
+                if let Some(dl_id) = target_id {
+                    if assigned.insert(dl_id.clone()) {
+                        if let Some(entry) = db_guard.downloads.get_mut(&dl_id) {
+                            entry.queue_position = Some(pos);
+                            pos += 1;
+                            updated += 1;
+                        }
+                    }
+                }
+            }
+            // Keep any remaining items after the explicitly ordered ones
+            let mut remaining: Vec<(String, u64, u64)> = db_guard
+                .downloads
+                .iter()
+                .filter(|(k, _)| !assigned.contains(*k))
+                .map(|(k, v)| (k.clone(), v.queue_position.unwrap_or(u64::MAX), v.started_at))
+                .collect();
+            remaining.sort_by_key(|(_, qp, sa)| (*qp, std::cmp::Reverse(*sa)));
+            for (dl_id, _, _) in remaining {
+                if let Some(entry) = db_guard.downloads.get_mut(&dl_id) {
+                    entry.queue_position = Some(pos);
+                    pos += 1;
+                }
+            }
+        }
+
+        // Mirror updated queue_position into active_downloads too
+        {
+            let db_guard = self.db.read();
+            let mut active_guard = self.active_downloads.write();
+            for (dl_id, active) in active_guard.iter_mut() {
+                if let Some(saved) = db_guard.downloads.get(dl_id) {
+                    active.meta.queue_position = saved.queue_position;
+                }
+            }
+        }
+
+        self.save_downloads_meta_async();
+        self.pump_download_queue();
+        self.broadcast_download_events();
+        updated
     }
 
     pub fn clear_completed_downloads(&self) -> usize {
@@ -1651,12 +1715,13 @@ impl DownloadsManager {
                     return;
                 }
 
-                let to_resume: Vec<DownloadItemMeta> = {
+                let mut to_resume: Vec<DownloadItemMeta> = {
                     let mut db_guard = dl_mgr_resume.db.write();
                     let mut items = Vec::new();
                     for saved in db_guard.downloads.values_mut() {
                         if saved.status == "paused" && saved.auto_paused_for_stream {
                             saved.auto_paused_for_stream = false;
+                            saved.status = "queued".to_string();
                             items.push(saved.clone());
                         }
                     }
@@ -1664,22 +1729,14 @@ impl DownloadsManager {
                 };
 
                 if !to_resume.is_empty() {
-                    dl_mgr_resume.save_downloads_meta();
-                    for item in to_resume {
-                        info!(
-                            "[Downloads] Auto-resuming download \"{}\" ({}) now that playback stopped",
-                            item.title, item.id
-                        );
-                        dl_mgr_resume.start_download(
-                            &item.hash,
-                            &item.title,
-                            &item.imdb_id,
-                            item.season,
-                            item.episode,
-                            item.file_idx,
-                            false,
-                        );
-                    }
+                    // Respect strict queue order (queue_position ASC, then started_at ASC)
+                    to_resume.sort_by_key(|it| (it.queue_position.unwrap_or(u64::MAX), it.started_at));
+                    info!(
+                        "[Downloads] Auto-resuming {} stream-paused download(s) in queue order",
+                        to_resume.len()
+                    );
+                    dl_mgr_resume.save_downloads_meta_async();
+                    dl_mgr_resume.pump_download_queue();
                     dl_mgr_resume.broadcast_download_events();
                 }
             });
@@ -1695,36 +1752,33 @@ impl DownloadsManager {
 
     /// Restores in-progress downloads on engine startup
     pub fn restore_downloads(self: &Arc<Self>) {
-        let items_to_restore: Vec<DownloadItemMeta> = {
+        let mut items_to_restore: Vec<DownloadItemMeta> = {
             let mut db_guard = self.db.write();
             let mut list = Vec::new();
             for saved in db_guard.downloads.values_mut() {
                 if saved.status == "downloading"
                     || saved.status == "loading"
+                    || saved.status == "queued"
                     || (saved.status == "paused" && saved.auto_paused_for_stream)
                 {
                     saved.auto_paused_for_stream = false;
+                    saved.status = "queued".to_string();
                     list.push(saved.clone());
                 }
             }
             list
         };
 
+        items_to_restore.sort_by_key(|it| (it.queue_position.unwrap_or(u64::MAX), it.started_at));
+
         info!(
-            "[Downloads] Restoring {} active downloads from saved database...",
+            "[Downloads] Restoring {} active/queued downloads from saved database in queue order...",
             items_to_restore.len()
         );
 
-        for item in items_to_restore {
-            self.start_download(
-                &item.hash,
-                &item.title,
-                &item.imdb_id,
-                item.season,
-                item.episode,
-                item.file_idx,
-                false,
-            );
+        if !items_to_restore.is_empty() {
+            self.save_downloads_meta_async();
+            self.pump_download_queue();
         }
 
         self.seed_completed_downloads();

@@ -23,12 +23,30 @@ parking_lot.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true
 librqbit = { workspace = true, optional = true }
+rcgen = { workspace = true, optional = true }
+rustls = { workspace = true, optional = true }
+tokio-rustls = { workspace = true, optional = true }
+hyper = { workspace = true, optional = true }
+hyper-util = { workspace = true, optional = true }
+sha2 = { workspace = true, optional = true }
+rand = { workspace = true, optional = true }
+hex = { workspace = true, optional = true }
 sysinfo.workspace = true
 dirs.workspace = true
 percent-encoding = "2.3"
 once_cell = "1.20"
 
 [features]
-default = ["rqbit-backend"]
+default = ["rqbit-backend", "lan-server"]
 rqbit-backend = ["dep:librqbit"]
+lan-server = [
+    "dep:rcgen",
+    "dep:rustls",
+    "dep:tokio-rustls",
+    "dep:hyper",
+    "dep:hyper-util",
+    "dep:sha2",
+    "dep:rand",
+    "dep:hex",
+]
 

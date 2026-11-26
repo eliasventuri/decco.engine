@@ -7,7 +7,7 @@ members = [
 ]
 
 [workspace.package]
-version = "2.0.0"
+version = "2.0.4"
 edition = "2021"
 authors = ["Decco Team"]
 license = "MIT"
@@ -33,6 +33,14 @@ thiserror = "1.0"
 librqbit = { version = "8.1", default-features = false, features = ["rust-tls"] }
 sysinfo = "0.32"
 dirs = "5.0"
+rcgen = { version = "0.13", default-features = false, features = ["crypto", "ring"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+hyper = { version = "1.4", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio", "server-auto", "service"] }
+sha2 = "0.10"
+rand = "0.8"
+hex = "0.4"
 
 [profile.release]
 opt-level = 3

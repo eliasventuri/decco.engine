@@ -1,7 +1,7 @@
 ; Decco Engine (Rust) - NSIS Always-Silent Installer
 
 !ifndef APP_VERSION
-  !define APP_VERSION "2.0.0"
+  !define APP_VERSION "2.0.4"
 !endif
 
 !ifndef EXE_PATH
@@ -70,6 +70,10 @@ Section "Decco Engine" SecMain
   CreateDirectory "$SMPROGRAMS\${APP_NAME}"
   CreateShortCut "$SMPROGRAMS\${APP_NAME}\${APP_NAME}.lnk" "$INSTDIR\${EXE_NAME}" "" "$INSTDIR\icon.ico"
   CreateShortCut "$SMPROGRAMS\${APP_NAME}\Desinstalar ${APP_NAME}.lnk" "$INSTDIR\Uninstall.exe" "" "$INSTDIR\icon.ico"
+
+  ; Best-effort Private-network LocalSubnet firewall rules for TV LAN sync (only private Wi-Fi/Ethernet, never public networks)
+  nsExec::Exec 'netsh advfirewall firewall delete rule name="Decco Engine LAN (TV Sync)"'
+  nsExec::Exec 'netsh advfirewall firewall add rule name="Decco Engine LAN (TV Sync)" dir=in action=allow program="$INSTDIR\${EXE_NAME}" profile=private remoteip=localsubnet enable=yes'
 
   ; Launch Decco Engine after install / silent update
   Exec '"$INSTDIR\${EXE_NAME}" --hidden'

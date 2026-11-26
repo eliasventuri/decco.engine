@@ -1,11 +1,42 @@
+param(
+    [switch]$NoBump,
+    [string]$SetVersion
+)
+
 $ErrorActionPreference = "Stop"
 
 $Root = $PSScriptRoot
-$CargoToml = Get-Content (Join-Path $Root "Cargo.toml") -Raw
-if ($CargoToml -match '(?m)^version\s*=\s*"([^"]+)"') {
-    $Version = $Matches[1]
+$CargoTomlPath = Join-Path $Root "Cargo.toml"
+$NsiPath = Join-Path $Root "installer\installer.nsi"
+$CargoToml = Get-Content $CargoTomlPath -Raw
+
+if ($CargoToml -match '(?m)^version\s*=\s*"(\d+)\.(\d+)\.(\d+)"') {
+    $Major = [int]$Matches[1]
+    $Minor = [int]$Matches[2]
+    $Patch = [int]$Matches[3]
+    $CurrentVersion = "$Major.$Minor.$Patch"
 } else {
-    $Version = "2.0.0"
+    throw "Could not parse [workspace.package] version in $CargoTomlPath"
+}
+
+if ($SetVersion) {
+    $Version = $SetVersion
+} elseif ($NoBump) {
+    $Version = $CurrentVersion
+} else {
+    $Version = "$Major.$Minor.$($Patch + 1)"
+}
+
+if ($Version -ne $CurrentVersion) {
+    Write-Host "[Decco] Bumping Rust engine version: $CurrentVersion -> $Version"
+    $UpdatedCargo = [regex]::Replace($CargoToml, '(?m)^version\s*=\s*"[^"]+"', "version = `"$Version`"", 1)
+    Set-Content -Path $CargoTomlPath -Value $UpdatedCargo -NoNewline
+
+    if (Test-Path $NsiPath) {
+        $NsiRaw = Get-Content $NsiPath -Raw
+        $UpdatedNsi = [regex]::Replace($NsiRaw, '(?m)^(\s*!define\s+APP_VERSION\s+)"[^"]+"', "`$1`"$Version`"", 1)
+        Set-Content -Path $NsiPath -Value $UpdatedNsi -NoNewline
+    }
 }
 
 $ReleaseDir = Join-Path $Root "target\release"
@@ -39,7 +70,6 @@ if (-not $Makensis) {
 
 $SetupOut = Join-Path $ReleaseDir "decco-engine-Setup-$Version.exe"
 $LatestOut = Join-Path $ReleaseDir "decco-engine-latest.exe"
-$NsiPath = Join-Path $Root "installer\installer.nsi"
 
 Write-Host "[Decco] Packaging silent-capable NSIS installer v$Version using $Makensis..."
 & $Makensis `
@@ -53,7 +83,7 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 Copy-Item -Path $SetupOut -Destination $LatestOut -Force
-Write-Host "[Decco] Installer ready:"
+Write-Host "[Decco] Installer ready (v$Version):"
 Write-Host "  - $SetupOut"
 Write-Host "  - $LatestOut"
 Write-Host "  - Silent test: `"$SetupOut`" /S"

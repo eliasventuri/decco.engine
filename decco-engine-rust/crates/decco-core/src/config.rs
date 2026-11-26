@@ -4,6 +4,12 @@ use std::path::{Path, PathBuf};
 /// Primary default port (synced with desktop engine)
 pub const DEFAULT_PRIMARY_PORT: u16 = 18889;
 
+/// Default TLS 1.3 port for secure LAN TV storage & sync
+pub const DEFAULT_LAN_TLS_PORT: u16 = 18890;
+
+/// Default UDP port for zero-config LAN discovery probes
+pub const DEFAULT_LAN_DISCOVERY_PORT: u16 = 18891;
+
 /// All ports the engine attempts to bind to (Windows & Android)
 pub const PORTS_TO_TRY: &[u16] = &[18889, 18888, 28888, 38888, 48888, 8888];
 
@@ -77,10 +83,16 @@ pub struct EngineConfig {
     pub update_info_path: PathBuf,
     /// Path to `decco-engine.log`
     pub log_file_path: PathBuf,
+    /// Path to `lan-security.json` (TLS cert, owner binding, paired TV devices)
+    pub lan_security_path: PathBuf,
     /// Android TV low-memory/connection mode
     pub is_tv_mode: bool,
     /// Ports to bind HTTP server
     pub ports: Vec<u16>,
+    /// Port to bind LAN TLS server (0 disables LAN listener)
+    pub lan_tls_port: u16,
+    /// Port to bind LAN UDP discovery responder (0 disables UDP responder)
+    pub lan_discovery_port: u16,
 }
 
 impl EngineConfig {
@@ -91,6 +103,7 @@ impl EngineConfig {
         let downloads_meta_path = completed_downloads_dir.join("downloads-meta.json");
         let update_info_path = streaming_cache_dir.join("update-info.json");
         let log_file_path = streaming_cache_dir.join("decco-engine.log");
+        let lan_security_path = base_dir.join("lan-security.json");
 
         let _ = std::fs::create_dir_all(&streaming_cache_dir);
         let _ = std::fs::create_dir_all(&completed_downloads_dir);
@@ -103,8 +116,11 @@ impl EngineConfig {
             downloads_meta_path,
             update_info_path,
             log_file_path,
+            lan_security_path,
             is_tv_mode,
             ports: PORTS_TO_TRY.to_vec(),
+            lan_tls_port: if is_tv_mode { 0 } else { DEFAULT_LAN_TLS_PORT },
+            lan_discovery_port: if is_tv_mode { 0 } else { DEFAULT_LAN_DISCOVERY_PORT },
         }
     }
 

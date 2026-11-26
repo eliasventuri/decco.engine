@@ -85,7 +85,8 @@ async fn main() -> anyhow::Result<()> {
     Arc::clone(&updater).start_periodic_check();
 
     // Initialize System Tray & Win32 message pump
-    match tray::create_system_tray(&updater) {
+    let lan_enabled_initial = engine.state.lan_mgr.is_enabled();
+    match tray::create_system_tray(&updater, lan_enabled_initial) {
         Ok((_tray_icon, menu_ids)) => {
             let menu_channel = MenuEvent::receiver();
 

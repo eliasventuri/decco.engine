@@ -1,6 +1,8 @@
 pub mod cache;
 pub mod config;
 pub mod downloads;
+#[cfg(feature = "lan-server")]
+pub mod lan;
 pub mod live_proxy;
 pub mod server;
 pub mod torrent;
@@ -29,9 +31,11 @@ impl DeccoEngine {
             Arc::clone(&cache_mgr),
         ));
         let downloads_mgr = Arc::new(DownloadsManager::new(
-            config,
+            config.clone(),
             Arc::clone(&torrent_mgr),
         ));
+        #[cfg(feature = "lan-server")]
+        let lan_mgr = Arc::new(crate::lan::LanSecurityManager::new(&config));
         let (shutdown, _) = watch::channel(false);
         let http_client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(12))
@@ -44,6 +48,8 @@ impl DeccoEngine {
                 torrent_mgr,
                 downloads_mgr,
                 cache_mgr,
+                #[cfg(feature = "lan-server")]
+                lan_mgr,
                 shutdown,
                 auth_token: None,
                 http_client,

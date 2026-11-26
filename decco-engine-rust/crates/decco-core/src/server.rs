@@ -41,6 +41,8 @@ pub struct AppState {
     pub torrent_mgr: Arc<TorrentEngineManager>,
     pub downloads_mgr: Arc<DownloadsManager>,
     pub cache_mgr: Arc<CacheManager>,
+    #[cfg(feature = "lan-server")]
+    pub lan_mgr: Arc<crate::lan::LanSecurityManager>,
     pub shutdown: watch::Sender<bool>,
     pub auth_token: Option<String>,
     pub http_client: reqwest::Client,
@@ -87,11 +89,37 @@ pub struct SettingsBody {
 }
 
 #[derive(Debug, Deserialize, Default)]
+pub struct ReorderBody {
+    pub order: Vec<String>,
+}
+
+async fn handle_download_reorder(
+    State(state): State<AppState>,
+    Json(body): Json<ReorderBody>,
+) -> impl IntoResponse {
+    let updated = state.downloads_mgr.reorder_downloads(&body.order);
+    Json(json!({ "status": "reordered", "updated": updated }))
+}
+
+#[derive(Debug, Deserialize, Default)]
 pub struct MeteredQuery {
     pub value: Option<bool>,
 }
 
-/// Middleware for CORS, Private Network Access (PNA), and Loopback IP security
+fn is_trusted_loopback_origin(origin: &str) -> bool {
+    let lower = origin.trim().to_ascii_lowercase();
+    lower == "https://decco.tv"
+        || lower == "https://www.decco.tv"
+        || lower.ends_with(".decco.tv")
+        || lower.ends_with(".vercel.app")
+        || lower.starts_with("http://localhost:")
+        || lower == "http://localhost"
+        || lower.starts_with("http://127.0.0.1:")
+        || lower == "http://127.0.0.1"
+        || lower.starts_with("chrome-extension://")
+}
+
+/// Middleware for CORS, Private Network Access (PNA), Origin verification, and Loopback IP security
 async fn cors_and_loopback_middleware(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     req: Request,
@@ -105,6 +133,17 @@ async fn cors_and_loopback_middleware(
             "Access denied: connections allowed only from localhost",
         )
             .into_response();
+    }
+
+    if let Some(origin_val) = req.headers().get("origin").and_then(|v| v.to_str().ok()) {
+        if !is_trusted_loopback_origin(origin_val) {
+            warn!("[Security] Blocked untrusted browser Origin on loopback: {}", origin_val);
+            return (
+                StatusCode::FORBIDDEN,
+                "Access denied: untrusted browser origin",
+            )
+                .into_response();
+        }
     }
 
     let is_pna = req
@@ -176,7 +215,7 @@ async fn auth_middleware(
 }
 
 pub fn build_router(state: AppState) -> Router {
-    Router::new()
+    let router = Router::new()
         .route("/ping", get(handle_ping))
         .route("/status/check", get(handle_status_check))
         .route("/prewarm/:hash", get(handle_prewarm))
@@ -238,6 +277,220 @@ pub fn build_router(state: AppState) -> Router {
             "/download/clear-completed",
             get(handle_download_clear_completed).post(handle_download_clear_completed),
         )
+        .route(
+            "/download/reorder",
+            axum::routing::post(handle_download_reorder),
+        )
+        .route("/download/settings", get(handle_download_settings))
+        .route(
+            "/download/settings/set",
+            get(handle_download_settings_set).post(handle_download_settings_set),
+        )
+        .route(
+            "/download/subtitle/:hash/:lang",
+            get(handle_download_subtitle),
+        );
+
+    #[cfg(feature = "lan-server")]
+    let router = router
+        .route("/lan/status", get(handle_lan_status))
+        .route("/lan/bind-owner", axum::routing::post(handle_lan_bind_owner));
+
+    router
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth_middleware,
+        ))
+        .layer(middleware::from_fn(cors_and_loopback_middleware))
+        .with_state(state)
+}
+
+#[cfg(feature = "lan-server")]
+async fn handle_lan_status(State(state): State<AppState>) -> impl IntoResponse {
+    Json(state.lan_mgr.status_summary())
+}
+
+#[cfg(feature = "lan-server")]
+async fn handle_lan_bind_owner(
+    State(state): State<AppState>,
+    Json(body): Json<crate::lan::BindOwnerRequest>,
+) -> Response {
+    match state
+        .lan_mgr
+        .bind_owner_from_session(&state.http_client, &body.session_token)
+        .await
+    {
+        Ok((user_id, email)) => Json(json!({
+            "status": "bound",
+            "userId": user_id,
+            "email": email
+        }))
+        .into_response(),
+        Err(msg) => (StatusCode::UNAUTHORIZED, Json(json!({ "error": msg }))).into_response(),
+    }
+}
+
+#[cfg(feature = "lan-server")]
+fn is_safe_lan_path_identifiers(path: &str) -> bool {
+    if path.contains("..") || path.contains('\\') || path.contains('\0') {
+        return false;
+    }
+    true
+}
+
+#[cfg(feature = "lan-server")]
+async fn lan_security_guard_middleware(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    req: Request,
+    next: Next,
+) -> Response {
+    if !state.lan_mgr.is_enabled() {
+        return (StatusCode::FORBIDDEN, "LAN sharing disabled").into_response();
+    }
+
+    if !state.lan_mgr.is_allowed_lan_peer(addr.ip()) {
+        warn!("[LAN Security] Blocked peer outside local subnet: {}", addr);
+        return (StatusCode::FORBIDDEN, "Peer IP outside local subnet").into_response();
+    }
+
+    // Block all web browser requests (CSRF / Private Network Access / DNS rebinding protection)
+    if req.headers().contains_key("origin")
+        || req.headers().contains_key("sec-fetch-mode")
+        || req.headers().contains_key("sec-fetch-site")
+    {
+        warn!(
+            "[LAN Security] Blocked browser request on LAN port from {}",
+            addr.ip()
+        );
+        return (
+            StatusCode::FORBIDDEN,
+            "Browser origins forbidden on native LAN port",
+        )
+            .into_response();
+    }
+
+    // Host header validation to prevent DNS rebinding
+    if let Some(host_hdr) = req.headers().get("host").and_then(|v| v.to_str().ok()) {
+        let host_only = if let Some(stripped) = host_hdr.strip_prefix('[') {
+            stripped.split(']').next().unwrap_or("")
+        } else {
+            host_hdr.split(':').next().unwrap_or("")
+        };
+        let valid_host = host_only.parse::<std::net::IpAddr>().is_ok()
+            || host_only.eq_ignore_ascii_case("decco-lan.local")
+            || (*state.lan_mgr.allow_loopback_peers_for_test.read()
+                && host_only.eq_ignore_ascii_case("localhost"));
+        if !valid_host {
+            warn!("[LAN Security] Blocked invalid Host header: {}", host_hdr);
+            return (StatusCode::FORBIDDEN, "Invalid Host header").into_response();
+        }
+    }
+
+    if !is_safe_lan_path_identifiers(req.uri().path()) {
+        return (StatusCode::BAD_REQUEST, "Malformed path").into_response();
+    }
+
+    next.run(req).await
+}
+
+#[cfg(feature = "lan-server")]
+async fn lan_bearer_auth_middleware(
+    State(state): State<AppState>,
+    req: Request,
+    next: Next,
+) -> Response {
+    let token_opt = req
+        .headers()
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer ").or_else(|| v.strip_prefix("bearer ")));
+
+    match token_opt {
+        Some(token) if state.lan_mgr.validate_bearer_token(token) => next.run(req).await,
+        _ => (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "error": "Unauthorized LAN device" })),
+        )
+            .into_response(),
+    }
+}
+
+#[cfg(feature = "lan-server")]
+async fn handle_lan_hello(State(state): State<AppState>) -> impl IntoResponse {
+    let summary = state.lan_mgr.status_summary();
+    Json(json!({
+        "status": "ok",
+        "protocolVersion": 1,
+        "nodeId": summary.node_id,
+        "deviceName": summary.device_name,
+        "httpsPort": summary.https_port,
+        "certSha256": summary.cert_sha256,
+        "hasOwner": summary.has_owner,
+        "pairedDevicesCount": summary.paired_devices_count
+    }))
+}
+
+#[cfg(feature = "lan-server")]
+async fn handle_lan_pair(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    Json(body): Json<crate::lan::PairRequest>,
+) -> Response {
+    if !state.lan_mgr.check_pair_rate_limit(addr.ip()) {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(json!({ "error": "Too many pairing attempts, try again later" })),
+        )
+            .into_response();
+    }
+
+    match state.lan_mgr.pair_tv_device(&state.http_client, body).await {
+        Ok(resp) => Json(resp).into_response(),
+        Err((code, msg)) => (code, Json(json!({ "error": msg }))).into_response(),
+    }
+}
+
+/// Builds the strictly-scoped LAN TLS router (excludes desktop-only `/download/open`, `/live/proxy`, etc.)
+#[cfg(feature = "lan-server")]
+pub fn build_lan_router(state: AppState) -> Router {
+    let protected_routes = Router::new()
+        .route("/ping", get(handle_ping))
+        .route("/status/check", get(handle_status_check))
+        .route("/prewarm/:hash", get(handle_prewarm))
+        .route("/start/:hash", get(handle_start))
+        .route("/pause/:hash", get(handle_pause).post(handle_pause))
+        .route("/stop/:hash", get(handle_stop).post(handle_stop))
+        .route("/status/:hash", get(handle_status))
+        .route("/status/events/:hash", get(handle_status_events))
+        .route("/proxy/:hash", get(handle_proxy))
+        .route("/hls/:hash/:file", get(handle_hls_route))
+        .route("/subtitles/:hash", get(handle_list_subtitles))
+        .route(
+            "/subtitles/:hash/extract/:index",
+            get(handle_extract_subtitle),
+        )
+        .route(
+            "/download/start",
+            get(handle_download_start).post(handle_download_start),
+        )
+        .route("/download/list", get(handle_download_list))
+        .route("/download/events", get(handle_download_events))
+        .route(
+            "/download/pause/:id",
+            get(handle_download_pause).post(handle_download_pause),
+        )
+        .route(
+            "/download/resume/:id",
+            get(handle_download_resume).post(handle_download_resume),
+        )
+        .route(
+            "/download/delete/:id",
+            get(handle_download_delete)
+                .post(handle_download_delete)
+                .delete(handle_download_delete),
+        )
+        .route("/download/force-start/:id", get(handle_download_force_start))
         .route("/download/settings", get(handle_download_settings))
         .route(
             "/download/settings/set",
@@ -249,9 +502,19 @@ pub fn build_router(state: AppState) -> Router {
         )
         .layer(middleware::from_fn_with_state(
             state.clone(),
-            auth_middleware,
+            lan_bearer_auth_middleware,
+        ));
+
+    let public_handshake_routes = Router::new()
+        .route("/lan/hello", get(handle_lan_hello))
+        .route("/lan/pair", axum::routing::post(handle_lan_pair));
+
+    public_handshake_routes
+        .merge(protected_routes)
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            lan_security_guard_middleware,
         ))
-        .layer(middleware::from_fn(cors_and_loopback_middleware))
         .with_state(state)
 }
 
@@ -783,7 +1046,7 @@ async fn handle_list_subtitles(
     AxumPath(hash): AxumPath<String>,
 ) -> Response {
     let clean_hash = hash.trim().to_ascii_lowercase();
-    let (cached_subs, cached_audio) = {
+    let (cached_subs, cached_audio, is_mock) = {
         let guard = state.torrent_mgr.active_engines.read();
         let Some(eng) = guard.get(&clean_hash) else {
             return (
@@ -799,13 +1062,29 @@ async fn handle_list_subtitles(
             )
                 .into_response();
         }
-        (eng.embedded_subtitles.clone(), eng.audio_tracks.clone())
+        (
+            eng.embedded_subtitles.clone(),
+            eng.audio_tracks.clone(),
+            eng.is_mock,
+        )
     };
 
     if let Some(subs) = cached_subs {
         return Json(json!({
             "subtitles": subs,
-            "audioTracks": cached_audio.unwrap_or_default()
+            "audioTracks": cached_audio.unwrap_or_default(),
+            "pending": false
+        }))
+        .into_response();
+    }
+
+    // For active P2P torrents, do NOT spawn competing inline ffprobe processes inside the HTTP handler:
+    // the background stats loop in torrent.rs probes once bytes flow and broadcasts results via SSE.
+    if !is_mock {
+        return Json(json!({
+            "subtitles": [],
+            "audioTracks": cached_audio.unwrap_or_default(),
+            "pending": true
         }))
         .into_response();
     }
@@ -1278,6 +1557,11 @@ pub async fn start_multiport_server(state: AppState) -> anyhow::Result<Vec<u16>>
         }
     }
 
+    #[cfg(feature = "lan-server")]
+    if state.torrent_mgr.config.lan_tls_port > 0 {
+        spawn_lan_tls_server(state.clone()).await;
+    }
+
     // Background startup tasks (restore downloads + hourly 72h cache cleanup)
     let state_bg = state.clone();
     tokio::spawn(async move {
@@ -1314,6 +1598,100 @@ pub async fn start_multiport_server(state: AppState) -> anyhow::Result<Vec<u16>>
     });
 
     Ok(bound_ports)
+}
+
+#[cfg(feature = "lan-server")]
+pub async fn spawn_lan_tls_server(state: AppState) -> Option<u16> {
+    let preferred_port = state.torrent_mgr.config.lan_tls_port;
+    let candidate_ports = [preferred_port, preferred_port.saturating_add(2)];
+
+    let tls_acceptor = match state.lan_mgr.build_tls_acceptor() {
+        Ok(acc) => acc,
+        Err(e) => {
+            error!("[LAN TLS] Failed to initialize TLS 1.3 acceptor: {}", e);
+            return None;
+        }
+    };
+
+    let mut bound_listener = None;
+    let mut actual_port = 0u16;
+    for port in candidate_ports {
+        if port == 0 {
+            continue;
+        }
+        let bind_addr = SocketAddr::from(([0, 0, 0, 0], port));
+        match tokio::net::TcpListener::bind(bind_addr).await {
+            Ok(l) => {
+                actual_port = l.local_addr().map(|a| a.port()).unwrap_or(port);
+                info!(
+                    "[LAN TLS] Secure TLS 1.3 server listening on 0.0.0.0:{}",
+                    actual_port
+                );
+                bound_listener = Some(l);
+                break;
+            }
+            Err(e) => {
+                warn!("[LAN TLS] Failed to bind 0.0.0.0:{}: {}", port, e);
+            }
+        }
+    }
+
+    let listener = bound_listener?;
+    *state.lan_mgr.bound_https_port.write() = actual_port;
+
+    // Launch UDP discovery responder
+    if state.torrent_mgr.config.lan_discovery_port > 0 {
+        let lan_mgr_udp = Arc::clone(&state.lan_mgr);
+        let shutdown_udp = state.shutdown.subscribe();
+        tokio::spawn(async move {
+            crate::lan::spawn_lan_udp_discovery(lan_mgr_udp, shutdown_udp).await;
+        });
+    }
+
+    let lan_router = build_lan_router(state.clone());
+    let lan_mgr = Arc::clone(&state.lan_mgr);
+    let mut shutdown = state.shutdown.subscribe();
+
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = shutdown.changed() => break,
+                accept_res = listener.accept() => {
+                    let Ok((tcp_stream, remote_addr)) = accept_res else { continue };
+                    if !lan_mgr.is_enabled() || !lan_mgr.is_allowed_lan_peer(remote_addr.ip()) {
+                        drop(tcp_stream);
+                        continue;
+                    }
+                    let _ = tcp_stream.set_nodelay(true);
+                    let acceptor = tls_acceptor.clone();
+                    let router_for_conn = lan_router
+                        .clone()
+                        .layer(axum::Extension(ConnectInfo(remote_addr)));
+
+                    tokio::spawn(async move {
+                        let Ok(Ok(tls_stream)) = tokio::time::timeout(
+                            Duration::from_secs(5),
+                            acceptor.accept(tcp_stream),
+                        )
+                        .await
+                        else {
+                            return;
+                        };
+
+                        let io = hyper_util::rt::TokioIo::new(tls_stream);
+                        let hyper_service = hyper_util::service::TowerToHyperService::new(router_for_conn);
+                        let _ = hyper_util::server::conn::auto::Builder::new(
+                            hyper_util::rt::TokioExecutor::new(),
+                        )
+                        .serve_connection(io, hyper_service)
+                        .await;
+                    });
+                }
+            }
+        }
+    });
+
+    Some(actual_port)
 }
 
 #[cfg(test)]
@@ -1454,6 +1832,135 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(auth.status(), 200);
+
+        engine.shutdown();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(feature = "lan-server")]
+    #[tokio::test]
+    async fn lan_router_enforces_tofu_bearer_browser_and_host_security() {
+        let dir = std::env::temp_dir().join(format!(
+            "decco_lan_test_{}_{}",
+            std::process::id(),
+            crate::config::now_ms()
+        ));
+        let mut cfg = EngineConfig::new(dir.clone(), false);
+        cfg.lan_tls_port = 0;
+        cfg.lan_discovery_port = 0;
+        let engine = DeccoEngine::new(cfg);
+        engine.state.lan_mgr.set_enabled(true);
+        *engine.state.lan_mgr.allow_loopback_peers_for_test.write() = true;
+
+        let lan_router = build_lan_router(engine.state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        *engine.state.lan_mgr.bound_https_port.write() = port;
+
+        let mut shutdown = engine.state.shutdown.subscribe();
+        tokio::spawn(async move {
+            let _ = axum::serve(
+                listener,
+                lan_router.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .with_graceful_shutdown(async move {
+                let _ = shutdown.changed().await;
+            })
+            .await;
+        });
+
+        let base = format!("http://127.0.0.1:{}", port);
+        let client = reqwest::Client::new();
+
+        // 1. Unauthenticated /download/list MUST return 401
+        let unauth_dl = client
+            .get(format!("{}/download/list", base))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(unauth_dl.status(), 401);
+
+        // 2. Browser Origin header MUST be rejected (403) even on public /lan/hello
+        let browser_req = client
+            .get(format!("{}/lan/hello", base))
+            .header("Origin", "https://evil.example")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(browser_req.status(), 403);
+
+        // 3. DNS Rebinding Host header MUST be rejected (403)
+        let rebind_req = client
+            .get(format!("{}/lan/hello", base))
+            .header("Host", "evil.example:18890")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(rebind_req.status(), 403);
+
+        // 4. Desktop-only /download/open and /live/proxy MUST NOT be exposed (404/401)
+        // First pair a legitimate first TV device (TOFU)
+        let pair_resp = client
+            .post(format!("{}/lan/pair", base))
+            .json(&json!({
+                "deviceId": "tv_living_room_001",
+                "deviceName": "Sony Bravia TV"
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(pair_resp.status(), 200);
+        let pair_json: serde_json::Value = pair_resp.json().await.unwrap();
+        let tv_token = pair_json["token"].as_str().unwrap().to_string();
+        assert!(tv_token.starts_with("dlan_"));
+
+        // 5. Second unknown unauthenticated device MUST be blocked (403) once first TV paired
+        let rogue_pair = client
+            .post(format!("{}/lan/pair", base))
+            .json(&json!({
+                "deviceId": "rogue_neighbor_999",
+                "deviceName": "Rogue Device"
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(rogue_pair.status(), 403);
+
+        // 6. Paired TV can access /download/list with its Bearer token
+        let authed_dl = client
+            .get(format!("{}/download/list", base))
+            .bearer_auth(&tv_token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(authed_dl.status(), 200);
+
+        // 7. Sensitive desktop routes (/download/open/abc, /live/proxy) are NOT mounted (404)
+        let open_attempt = client
+            .get(format!("{}/download/open/abc", base))
+            .bearer_auth(&tv_token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(open_attempt.status(), 404);
+
+        let live_attempt = client
+            .get(format!("{}/live/proxy?url=http://example.com", base))
+            .bearer_auth(&tv_token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(live_attempt.status(), 404);
+
+        // 8. Disabling LAN sharing immediately blocks even already-paired TV (403)
+        engine.state.lan_mgr.set_enabled(false);
+        let disabled_req = client
+            .get(format!("{}/download/list", base))
+            .bearer_auth(&tv_token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(disabled_req.status(), 403);
 
         engine.shutdown();
         let _ = std::fs::remove_dir_all(dir);
